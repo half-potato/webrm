@@ -31,8 +31,14 @@ const uvec3 kTetTriangles[4] = uvec3[4](
     uvec3(3, 0, 1)
 );
 
-float compute_integral_1D(float c0, float c1, float d_dt) {
+vec3 compute_integral(vec3 c0, vec3 c1, float d_dt) {
+    float alpha = exp(-d_dt);
+    float X = (-d_dt*alpha + 1.f - alpha);
+    float Y = (d_dt-1.f) + alpha;
+    return (X*c0+Y*c1) / d_dt;
+}
 
+float compute_integral_1D(float c0, float c1, float d_dt) {
     float alpha = exp(-d_dt);
     float X = (-d_dt*alpha + 1.f - alpha);
     float Y = (d_dt-1.f) + alpha;
@@ -43,6 +49,7 @@ float integrate_channel(
     float t_n, float t_f,
     float c_at_t0, float dc_dt, float density)
 {
+
     // Find where the linear color function C(t) would cross zero.
     float t_zero = clamp(-(c_at_t0 / dc_dt), t_n, t_f);
 
@@ -89,9 +96,16 @@ void main () {
 
     opticalDepth *= t.y - t.x;
     float T = exp(-opticalDepth);
+    vec3 c_start = v_baseColor + dc_dt * t.x;
+    vec3 c_end   = v_baseColor + dc_dt * t.y;
+    vec3 C = compute_integral(c_start, c_end, opticalDepth);
     fragColor = vec4(
-        integrate_channel(t.x, t.y, v_baseColor.r, dc_dt, v_tetDensity),
-        integrate_channel(t.x, t.y, v_baseColor.g, dc_dt, v_tetDensity),
-        integrate_channel(t.x, t.y, v_baseColor.b, dc_dt, v_tetDensity),
+        // integrate_channel(t.x, t.y, v_baseColor.r, dc_dt, v_tetDensity),
+        // integrate_channel(t.x, t.y, v_baseColor.g, dc_dt, v_tetDensity),
+        // integrate_channel(t.x, t.y, v_baseColor.b, dc_dt, v_tetDensity),
+        C.r, C.g, C.b,
+        // v_baseColor.r,
+        // v_baseColor.g,
+        // v_baseColor.b,
         1.f-T);
 }

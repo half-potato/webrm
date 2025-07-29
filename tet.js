@@ -394,6 +394,9 @@ function createWorker(self) {
     // Statically allocated buffers for sorting
     let keys;       // Float32Array to store the sort key for each tet
     let payload;    // Uint32Array to store the original index of each tet
+    let tempKeys;
+    let tempPayload;
+    let intKeys; // This can also be a view that is updated
 
     // --- Sorting Algorithm ---
 
@@ -488,6 +491,9 @@ function createWorker(self) {
         for (let i = 0; i < data.tetCount; i++) {
             payload[i] = i; // Each payload element is the original index
         }
+        intKeys = new Uint32Array(keys.buffer);
+        tempKeys = new Uint32Array(data.tetCount);
+        tempPayload = new Uint32Array(data.tetCount);
 
         for (let i = 0; i < data.tetCount; i++) {
             const v_idx = data.indices[i * 4];
@@ -520,53 +526,62 @@ function createWorker(self) {
     /**
      * Recalculates keys, culls primitives, and sorts the payload buffer.
      */
-    function cullAndSortTets(viewProj, cameraPosition) {
+    function cullAndSortTets() {
         if (!data.vertices) return;
-        
-        extractFrustumPlanes(viewProj);
-        let visibleCount = 0;
-
-        // SINGLE PASS: Recalculate keys and perform culling in one loop
-        for (let i = 0; i < data.tetCount; i++) {
+        console.time("sort");
+        let maxDepth = -Infinity;
+        let minDepth = Infinity;
+        M = data.tetCount
+        let sizeList = new Int32Array(M);
+        for (let i = 0; i < M; i++) {
             const cx = data.circumcenters[i * 3], cy = data.circumcenters[i * 3 + 1], cz = data.circumcenters[i * 3 + 2];
-            
-            // 1. Frustum Culling (Bounding Sphere)
-            let culled = false;
-            // for (let j = 0; j < 6; j++) {
-            //     const dist = planes[j][0] * cx + planes[j][1] * cy + planes[j][2] * cz + planes[j][3];
-            //     if (dist + 1 < -Math.sqrt(data.circumradiiSq[i])) {
-            //         culled = true;
-            //         break;
-            //     }
-            // }
-
-            if (culled) {
-                keys[i] = Infinity;
-            } else {
-                // 2. Calculate Sort Key
-                const dx = cx - cameraPosition[0], dy = cy - cameraPosition[1], dz = cz - cameraPosition[2];
-                // For a back-to-front sort, we want the largest keys first.
-                // Radix sort is ascending, so we negate the key.
-                keys[i] = -(dx * dx + dy * dy + dz * dz - data.circumradiiSq[i]);
-                visibleCount++;
-            }
-            payload[i] = i; // Each payload element is the original index
+            const dx = cx - camPos[0], dy = cy - camPos[1], dz = cz - camPos[2];
+            // For a back-to-front sort, we want the largest keys first.
+            // Radix sort is ascending, so we negate the key.
+            let depth = (-(dx * dx + dy * dy + dz * dz - data.circumradiiSq[i]) * 4096) | 0;
+            sizeList[i] = depth;
+            if (depth > maxDepth) maxDepth = depth;
+            if (depth < minDepth) minDepth = depth;
         }
-        
-        // 3. Sort the buffers
-        radixSort(keys, payload);
 
-        // 4. Post the sorted indices back to the main thread
-        // We send a view of the payload buffer to avoid copying data.
-        const sortedIndicesView = payload.subarray(0, visibleCount);
-        // Create a new array and buffer by copying the data from the view.
-        const sortedIndicesCopy = new Uint32Array(sortedIndicesView);
+        // This is a 16 bit single-pass counting sort
+        let depthInv = (256 * 256 - 1) / (maxDepth - minDepth);
+        let counts0 = new Uint32Array(256 * 256);
+        for (let i = 0; i < M; i++) {
+            sizeList[i] = ((sizeList[i] - minDepth) * depthInv) | 0;
+            counts0[sizeList[i]]++;
+        }
+        let starts0 = new Uint32Array(256 * 256);
+        for (let i = 1; i < 256 * 256; i++)
+            starts0[i] = starts0[i - 1] + counts0[i - 1];
+        depthIndex = new Uint32Array(M);
+        for (let i = 0; i < M; i++)
+            depthIndex[starts0[sizeList[i]]++] = i;
 
-        // Transfer the NEW buffer, leaving the worker's original `payload` buffer untouched.
-        self.postMessage({ sortedIndices: sortedIndicesCopy, visibleCount }, [sortedIndicesCopy.buffer]);
+        console.timeEnd("sort");
+
+        lastPos = camPos;
+        self.postMessage({ depthIndex, M }, [
+            depthIndex.buffer,
+        ]);
     }
-    let sortRunning = false;
-    let latestSortData = null;
+    let camPos;
+    let lastPos = [];
+    const throttledSort = () => {
+        if (!sortRunning) {
+            sortRunning = true;
+            let lastPos = camPos;
+            cullAndSortTets();
+            setTimeout(() => {
+                sortRunning = false;
+                if (lastPos !== camPos) {
+                    throttledSort();
+                }
+            }, 0);
+        }
+    };
+
+    let sortRunning;
     self.onmessage = (e) => {
         if (e.data.fileBuffer) {
             processTetrahedralData(e.data.fileBuffer);
@@ -578,21 +593,16 @@ function createWorker(self) {
                 gradients: data.gradients,
                 tetCount: data.tetCount
             }, [data.vertices.buffer, data.indices.buffer, data.densities.buffer, data.colors.buffer, data.gradients.buffer]);
-        } else if (e.data.viewProj) {
-            latestSortData = e.data;
+        // } else if (e.data.buffer) {
+        //     buffer = e.data.buffer;
+        //     vertexCount = e.data.vertexCount;
+        // } else if (e.data.vertexCount) {
+        //     vertexCount = e.data.vertexCount;
+        } else if (e.data.camPos) {
+            camPos = e.data.camPos;
+            throttledSort();
         }
     };
-    function workLoop() {
-        if (!sortRunning && latestSortData) {
-            sortRunning = true;
-            const dataForSort = latestSortData;
-            latestSortData = null; // Consume the data
-            cullAndSortTets(dataForSort.viewProj, dataForSort.cameraPosition, dataForSort.viewProj.outputResolution );
-            sortRunning = false;
-        }
-        setTimeout(workLoop, 16); // Check again soon
-    }
-    workLoop();
 }
 
 // --- Main Application Logic ---
@@ -639,7 +649,8 @@ async function main() {
     if (!gl.getProgramParameter(program, gl.LINK_STATUS)) { console.error("Link Error:", gl.getProgramInfoLog(program)); return; }
     gl.useProgram(program);
 
-    gl.cullFace(gl.BACK);
+    // gl.enable(gl.PRIMITIVE_RESTART_FIXED_INDEX);
+    // gl.cullFace(gl.BACK);
     gl.disable(gl.DEPTH_TEST);
     gl.enable(gl.BLEND);
     gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
@@ -658,13 +669,32 @@ async function main() {
     const u_colorTextureSize = gl.getUniformLocation(program, "colorTextureSize");
     const u_gradientTextureSize = gl.getUniformLocation(program, "gradientTextureSize");
 
-    const vertexIdInTetBuffer = gl.createBuffer();
-    const vertexIdInTetData = new Uint8Array(Array.from({length: 12}, (_, i) => i));
-    gl.bindBuffer(gl.ARRAY_BUFFER, vertexIdInTetBuffer);
-    gl.bufferData(gl.ARRAY_BUFFER, vertexIdInTetData, gl.STATIC_DRAW);
-    const a_vertexIdInTet = gl.getAttribLocation(program, "vertexIdInTet");
-    gl.enableVertexAttribArray(a_vertexIdInTet);
-    gl.vertexAttribIPointer(a_vertexIdInTet, 1, gl.UNSIGNED_BYTE, 0, 0);
+    const indexBuffer = gl.createBuffer();
+    // This index data defines the 4 triangle faces using the 4 base vertices
+    const indexData = new Uint16Array([
+        // 0, 2, 1,   // Face 1
+        // 1, 2, 3,   // Face 2
+        // 0, 3, 2,   // Face 3
+        // 3, 0, 1    // Face 4
+        2, 3, 0, 1, 2, 3 // A different valid strip sequence
+        // Strip 1 (2 faces)
+        // 0, 1, 2, 3,
+        // // Stop this strip and start a new one
+        // 0xFFFF,
+        // // Strip 2 (the other 2 faces)
+        // 1, 0, 3, 2
+    ]);
+    // Bind it as the ELEMENT_ARRAY_BUFFER
+    gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, indexBuffer);
+    gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, indexData, gl.STATIC_DRAW);
+
+    // const vertexIdInTetBuffer = gl.createBuffer();
+    // const vertexIdInTetData = new Uint8Array(Array.from({length: 4}, (_, i) => i));
+    // gl.bindBuffer(gl.ARRAY_BUFFER, vertexIdInTetBuffer);
+    // gl.bufferData(gl.ARRAY_BUFFER, vertexIdInTetData, gl.STATIC_DRAW);
+    // const a_vertexIdInTet = gl.getAttribLocation(program, "vertexIdInTet");
+    // gl.enableVertexAttribArray(a_vertexIdInTet);
+    // gl.vertexAttribIPointer(a_vertexIdInTet, 1, gl.UNSIGNED_BYTE, 0, 0);
 
     const sortedIndexBuffer = gl.createBuffer();
     const a_tetId = gl.getAttribLocation(program, "tetId");
@@ -712,10 +742,11 @@ async function main() {
             setupTex(gradientTexture, 4, u_gradientTexture, u_gradientTextureSize, gl.RGB16F, gl.RGB, gl.HALF_FLOAT, e.data.gradients, 3);
 
 
-        } else if (e.data.sortedIndices) {
-            visibleCount = e.data.visibleCount;
+        } else if (e.data.depthIndex) {
+            visibleCount = e.data.M;
             gl.bindBuffer(gl.ARRAY_BUFFER, sortedIndexBuffer);
-            gl.bufferData(gl.ARRAY_BUFFER, e.data.sortedIndices, gl.DYNAMIC_DRAW);
+            console.log(e.data.depthIndex);
+            gl.bufferData(gl.ARRAY_BUFFER, e.data.depthIndex, gl.DYNAMIC_DRAW);
         }
         // lastSortedCameraPosition.set(camera.position);
     };
@@ -741,7 +772,7 @@ async function main() {
         lastFrameTime = now;
         
         const currentFps = 1 / Math.max(dt, 0.00001);
-        avgFps = avgFps * 0.95 + currentFps * 0.05;
+        avgFps = currentFps;
         fpsEl.innerText = `${Math.round(avgFps)} fps`;
         tetsDrawnEl.innerText = `${visibleCount.toLocaleString()} tetrahedra`;
         
@@ -752,18 +783,9 @@ async function main() {
         const projectionMatrix = camera.getProjectionMatrix(gl.canvas.clientWidth / gl.canvas.clientHeight);
         const viewProj = multiply4(projectionMatrix, viewMatrix);
 
-        const dx = camera.position[0] - lastSortedCameraPosition[0];
-        const dy = camera.position[1] - lastSortedCameraPosition[1];
-        const dz = camera.position[2] - lastSortedCameraPosition[2];
-        const distSq = dx*dx + dy*dy + dz*dz;
+        worker.postMessage({ camPos: camera.position, outputResolution: [gl.canvas.width, gl.canvas.height] });
 
-        // console.log(camera.position, lastSortedCameraPosition);
-        if (loaded && distSq > SORT_TRIGGER_THRESHOLD_SQ) {
-            worker.postMessage({ viewProj, cameraPosition: camera.position, outputResolution: [gl.canvas.width, gl.canvas.height] });
-            lastSortedCameraPosition.set(camera.position);
-        }
-
-        // worker.postMessage({ viewProj, cameraPosition: camera.position, outputResolution: [gl.canvas.width, gl.canvas.height] });
+        // worker.postMessage({ viewProj, camPos: camera.position, outputResolution: [gl.canvas.width, gl.canvas.height] });
         
         gl.uniformMatrix4fv(u_viewProjection, false, viewProj);
         gl.uniform3fv(u_rayOrigin, camera.position);
@@ -772,7 +794,14 @@ async function main() {
         gl.clear(gl.COLOR_BUFFER_BIT);
 
         if (visibleCount > 0) {
-            gl.drawArraysInstanced(gl.TRIANGLES, 0, 12, visibleCount);
+            // gl.drawArraysInstanced(gl.TRIANGLES, 0, 12, visibleCount);
+            gl.drawElementsInstanced(
+                gl.TRIANGLE_STRIP,      // mode
+                6,                // count (number of indices to draw)
+                gl.UNSIGNED_SHORT, // type of data in the index buffer
+                0,                 // offset
+                visibleCount
+            );
         }
         requestAnimationFrame(frame);
     };
@@ -824,7 +853,7 @@ async function main() {
         console.log(`Loading file from URL parameter: ${fileToLoad}`);
     } else {
         // Otherwise, fall back to the default file
-        fileToLoad = "splats/output.splat";
+        fileToLoad = "splats/room_small.splat";
         console.log(`Loading default file: ${fileToLoad}`);
     }
 

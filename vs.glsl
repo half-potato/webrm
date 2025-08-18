@@ -21,12 +21,13 @@ uniform ivec2 gradientTextureSize;
 in uint tetId;
 
 // OUTPUTS (same as before)
-out vec3 v_rayDir;
 flat out float v_tetDensity;
 flat out vec3 v_baseColor;
 out float v_dc_dt;
 out vec4 v_planeNumerators;
 out vec4 v_planeDenominators;
+out vec3 v_rayDir;
+out vec3 vertex;
 
 ivec2 getTexCoord(uint id, ivec2 size) {
     return ivec2(id % uint(size.x), id / uint(size.x));
@@ -35,19 +36,21 @@ ivec2 getTexCoord(uint id, ivec2 size) {
 void main () {
     // 1. Fetch the 4 world-space vertex positions for the CURRENT INSTANCE using tetId
     vec3 verts[4];
-    ivec2 indicesCoord = getTexCoord(tetId, indicesTextureSize);
+    // ivec2 indicesCoord = getTexCoord(tetId, indicesTextureSize);
+
+    ivec2 idxTC = getTexCoord(tetId, indicesTextureSize);
+    uvec4 idx4  = texelFetch(indicesTexture, idxTC, 0);
+
     for (int i=0; i<4; i++) {
-        uint v_idx = texelFetch(indicesTexture, indicesCoord, 0)[i];
+        uint v_idx = idx4[i];
         ivec2 vertexCoord = getTexCoord(v_idx, verticesTextureSize);
         verts[i] = texelFetch(verticesTexture, vertexCoord, 0).xyz;
     }
 
-    // 2. Select the final world position using the built-in gl_VertexID.
-    // The index buffer now provides the correct corner index directly.
     vec3 worldPos = verts[gl_VertexID];
+    vertex = worldPos;
 
-    // --- The rest of the shader is identical ---
-    v_rayDir = worldPos - rayOrigin;
+    v_rayDir = normalize(worldPos - rayOrigin);
 
     ivec2 densityCoord = getTexCoord(tetId, densityTextureSize);
     v_tetDensity = texelFetch(densityTexture, densityCoord, 0).r;
@@ -77,3 +80,4 @@ void main () {
 
     gl_Position = viewProjection * vec4(worldPos, 1.0);
 }
+

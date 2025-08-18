@@ -1,3 +1,5 @@
+//
+//
 // --- Matrix Math Utilities ---
 function multiply4(a, b) {
     let out = new Float32Array(16);
@@ -51,6 +53,7 @@ function invert4(a) {
     return out;
 }
 
+
 class Camera {
     constructor(position = [0, 5, 2], canvas) {
         this.canvas = canvas;
@@ -68,7 +71,7 @@ class Camera {
         this.position = new Float32Array(position);
         // Initial rotation quaternion is calculated to match the starting orbit view
         this.rotation = new Float32Array([0, 0, 0, 1]); 
-        this.baseMoveSpeed = 3.0;
+        this.baseMoveSpeed = 0.5;
         this.rollSpeed = 1.5;
 
         // --- State for Orbit-Cam (Euler-based) ---
@@ -216,9 +219,9 @@ class Camera {
             // Build view matrix from position and quaternion: V = R_inv * T_inv
             const conjugateQuat = [ -this.rotation[0], -this.rotation[1], -this.rotation[2], this.rotation[3] ];
             const rotationInvMatrix = this.mat4FromQuat(conjugateQuat);
-            
+
             const translationInv = [-this.position[0], -this.position[1], -this.position[2]];
-            
+
             // Manually multiply R_inv * T_inv
             const viewMatrix = rotationInvMatrix;
             viewMatrix[12] = translationInv[0] * viewMatrix[0] + translationInv[1] * viewMatrix[4] + translationInv[2] * viewMatrix[8];
@@ -235,7 +238,7 @@ class Camera {
             const eye_x = T[0] + D * Math.cos(pitch) * Math.cos(yaw);
             const eye_y = T[1] + D * Math.cos(pitch) * Math.sin(yaw);
             const eye_z = T[2] + D * Math.sin(pitch);
-            
+
             const eye = [eye_x, eye_y, eye_z];
 
             // Update the camera's canonical position property
@@ -271,7 +274,7 @@ class Camera {
             const rotatedMove = this.vec3TransformQuat(normalizedMove, this.rotation);
             this.position = this._v3Add(this.position, this._v3Scale(rotatedMove, speed * dt));
         }
-        
+
         // Handle roll
         let rollDelta = 0;
         if (this.keys.has('KeyQ')) rollDelta += this.rollSpeed * dt;
@@ -283,14 +286,14 @@ class Camera {
             this._quatNormalize(this.rotation);
         }
     }
-    
+
     _handlePointerMove(x, y, isMouseDown) {
         if (!isMouseDown) return;
 
         const dx = x - this.lastMousePos.x;
         const dy = y - this.lastMousePos.y;
         this.lastMousePos = { x, y };
-        
+
         const sensitivity = 0.004;
 
         if (this.mode === 'free') {
@@ -300,7 +303,7 @@ class Camera {
             // Create delta rotations around local axes for a fully ego-centric feel.
             const yawQuat = this.quatFromAxisAngle([0, 1, 0], yawDelta);     // Yaw around local-Y (up)
             const pitchQuat = this.quatFromAxisAngle([1, 0, 0], pitchDelta);   // Pitch around local-X (right)
-            
+
             // Combine the deltas (pitch, then yaw)
             const deltaQuat = this.quatMultiply(yawQuat, pitchQuat);
 
@@ -366,7 +369,7 @@ class Camera {
         this.canvas.addEventListener('touchend', (e) => {
             if (e.touches.length === 0) this.isMouseDown = false;
         });
-        
+
         this.canvas.addEventListener('touchmove', (e) => {
             e.preventDefault();
             if (this.mode === 'orbit' && e.touches.length > 0) {
@@ -383,78 +386,163 @@ class Camera {
                 }
             }
         }, { passive: false });
-        
+
         this.canvas.addEventListener('contextmenu', e => e.preventDefault());
     }
 }
+
 // --- Web Worker Logic ---
 function createWorker(self) {
     let data = { vertexCount: 0, tetCount: 0, vertices: null, indices: null, densities: null, colors: null, gradients: null, circumcenters: null, circumradiiSq: null };
 
-    // Statically allocated buffers for sorting
-    let keys;       // Float32Array to store the sort key for each tet
-    let payload;    // Uint32Array to store the original index of each tet
-    let tempKeys;
-    let tempPayload;
-    let intKeys; // This can also be a view that is updated
+    // NEW/CHANGED: ping-pong pool + reusable scratch
+    const outBufferPool = [];              // buffers returned from main
+    let sizeList = null;                   // Int32Array(M), reused
+    let counts0 = null, starts0 = null;    // Uint32Array(65536), reused
 
-    // --- Sorting Algorithm ---
+    let camPos;
+    let lastPos = [];
 
-    /**
-     * A Radix Sort implementation for 32-bit floats.
-     * It sorts the `keys` array in ascending order while performing the same swaps
-     * on the `payload` array, keeping them in sync.
-     * @param {Float32Array} keys The array of keys to sort.
-     * @param {Uint32Array} payload The payload array to sort in tandem.
-     */
-    function radixSort(keys, payload) {
-        const n = keys.length;
-        // Create integer view and temporary buffers without re-allocating them every time
-        const intKeys = new Uint32Array(keys.buffer);
-        const tempKeys = new Uint32Array(n);
-        const tempPayload = new Uint32Array(n);
+    // Statically allocated buffers for sorting (unchanged)
+    let keys, payload, tempKeys, tempPayload, intKeys;
 
-        // Radix sort is performed byte by byte (8 bits at a time)
-        for (let shift = 0; shift < 32; shift += 8) {
-            const counts = new Uint32Array(256).fill(0);
-
-            // 1. Counting pass: count occurrences of each byte value
-            for (let i = 0; i < n; i++) {
-                // We need to transform float bits into a sortable integer representation
-                let intValue = intKeys[i];
-                if (intValue & 0x80000000) { // If sign bit is 1 (negative float)
-                    intValue = ~intValue; // Flip all bits
-                } else { // If sign bit is 0 (positive float)
-                    intValue ^= 0x80000000; // Flip only the sign bit
-                }
-                counts[(intValue >> shift) & 0xFF]++;
+    // NEW: get an output array from pool or allocate once
+    function getDepthIndexArray(len) {
+        for (let i = 0; i < outBufferPool.length; i++) {
+            const buf = outBufferPool[i];
+            if (buf.byteLength === len * 4) { // Uint32Array length match
+                outBufferPool.splice(i, 1);
+                return new Uint32Array(buf);
             }
-
-            // 2. Prefix sum: create cumulative counts to determine position
-            for (let i = 1; i < 256; i++) {
-                counts[i] += counts[i - 1];
-            }
-
-            // 3. Distribution pass: place elements in sorted order
-            for (let i = n - 1; i >= 0; i--) {
-                let intValue = intKeys[i];
-                 if (intValue & 0x80000000) {
-                    intValue = ~intValue;
-                } else {
-                    intValue ^= 0x80000000;
-                }
-                const bucket = (intValue >> shift) & 0xFF;
-                counts[bucket]--;
-                const pos = counts[bucket];
-                tempKeys[pos] = intKeys[i];
-                tempPayload[pos] = payload[i];
-            }
-
-            // Copy sorted data from temp buffers back to original buffers
-            intKeys.set(tempKeys);
-            payload.set(tempPayload);
         }
+        return new Uint32Array(len);
     }
+
+    var _floatView = new Float32Array(1);
+    var _int32View = new Int32Array(_floatView.buffer);
+    function floatToHalf(float) {
+        _floatView[0] = float;
+        var f = _int32View[0];
+
+        var sign = (f >> 31) & 0x0001;
+        var exp = (f >> 23) & 0x00ff;
+        var frac = f & 0x007fffff;
+
+        var newExp;
+        if (exp == 0) {
+            newExp = 0;
+        } else if (exp < 113) {
+            newExp = 0;
+            frac |= 0x00800000;
+            frac = frac >> (113 - exp);
+            if (frac & 0x01000000) {
+                newExp = 1;
+                frac = 0;
+            }
+        } else if (exp < 142) {
+            newExp = exp - 112;
+        } else {
+            newExp = 31;
+            frac = 0;
+        }
+
+        return (sign << 15) | (newExp << 10) | (frac >> 13);
+    }
+
+    const float32ToUint16 = (() => {
+      const buf = new ArrayBuffer(4);
+      const f32 = new Float32Array(buf);
+      const u32 = new Uint32Array(buf);
+
+      return (v) => {
+        f32[0] = v;
+        const x = u32[0];
+
+        const sign = (x >>> 16) & 0x8000;      // 1 bit
+        let   exp  = (x >>> 23) & 0xff;        // 8 bits
+        let   mant =  x & 0x7fffff;            // 23 bits
+
+        // Inf / NaN
+        if (exp === 0xff) {
+          return sign | (mant ? 0x7e00 : 0x7c00); // qNaN or Inf
+        }
+
+        // Zero / subnormal in f32: treat as zero in half (too small to matter)
+        if (exp === 0 && mant === 0) return sign;
+
+        // Re-bias exponent from f32 (127) to f16 (15)
+        let e16 = exp - 127 + 15;
+
+        // Overflow -> Inf
+        if (e16 >= 31) return sign | 0x7c00;
+
+        if (e16 <= 0) {
+          // Subnormal half: fold implicit 1, shift, and RNE
+          if (e16 < -10) return sign; // too small -> ±0
+          mant |= 0x00800000; // add hidden 1
+          // shift so that we’ll end with a 10-bit mantissa after rounding
+          const shift = 14 - e16;               // 1..10
+          // guard+round+sticky over 13 bits total to end at 10 bits
+          let m = mant >>> (shift + 13);
+          const rem = mant & ((1 << (shift + 13)) - 1);
+          const halfway = 1 << (shift + 12);
+          // round-to-nearest-even
+          if (rem > halfway || (rem === halfway && (m & 1))) m += 1;
+          return sign | m;
+        }
+
+        // Normal half: round 23->10 bits (keep guard/round/sticky)
+        // remainder below bit 13
+        const rem = mant & 0x1fff;
+        let m10 = mant >>> 13;
+        const halfway = 0x1000; // 1<<12
+        if (rem > halfway || (rem === halfway && (m10 & 1))) {
+          m10 += 1;
+          if (m10 === 0x400) {   // mantissa overflow -> bump exponent
+            m10 = 0;
+            e16 += 1;
+            if (e16 >= 31) return sign | 0x7c00; // became Inf
+          }
+        }
+        return sign | (e16 << 10) | m10;
+      };
+    })();
+    // --- NEW: sort mode ('half16' | 'f32x2') ------------------------------------
+    // let sortMode = 'half16';
+    let sortMode = 'f32x2';
+
+    // float -> sortable uint32 (ascending numeric order)
+    const f32ToSortableU32 = (() => {
+      const buf = new ArrayBuffer(4);
+      const f32 = new Float32Array(buf);
+      const u32 = new Uint32Array(buf);
+      return (v) => {
+        f32[0] = v;
+        let u = u32[0] >>> 0;
+        // if negative: invert all bits; else flip sign bit
+        u = (u & 0x80000000) ? (~u >>> 0) : (u ^ 0x80000000);
+        return u >>> 0;
+      };
+    })();
+
+    // one 16-bit LSD counting pass (stable)
+    function radix16Pass(inKeys, inPayload, outKeys, outPayload, shift) {
+      // buckets are 0..65535, reuse global counts0/starts0
+      counts0.fill(0);
+      for (let i = 0, M = inKeys.length; i < M; i++) {
+        counts0[(inKeys[i] >>> shift) & 0xFFFF]++;
+      }
+      starts0[0] = 0;
+      for (let b = 1; b < 65536; b++) starts0[b] = starts0[b - 1] + counts0[b - 1];
+
+      for (let i = 0, M = inKeys.length; i < M; i++) {
+        const b = (inKeys[i] >>> shift) & 0xFFFF;
+        const dst = starts0[b]++;
+        outKeys[dst] = inKeys[i];
+        outPayload[dst] = inPayload[i];
+      }
+    }
+
     function processTetrahedralData(arrayBuffer) {
         const header = new Uint32Array(arrayBuffer, 0, 2);
         data.vertexCount = header[0];
@@ -483,16 +571,14 @@ function createWorker(self) {
 
         const circumcenterByteLength = data.tetCount * 3 * 4;
         data.circumcenters = new Float32Array(arrayBuffer.slice(offset, offset + circumcenterByteLength));
-        
+
         data.circumradiiSq = new Float32Array(data.tetCount);
 
         keys = new Float32Array(data.tetCount);
         payload = new Uint32Array(data.tetCount);
-        for (let i = 0; i < data.tetCount; i++) {
-            payload[i] = i; // Each payload element is the original index
-        }
-        intKeys = new Uint32Array(keys.buffer);
-        tempKeys = new Uint32Array(data.tetCount);
+        for (let i = 0; i < data.tetCount; i++) payload[i] = i;
+        intKeys     = new Uint32Array(data.tetCount);
+        tempKeys    = new Uint32Array(data.tetCount);
         tempPayload = new Uint32Array(data.tetCount);
 
         for (let i = 0; i < data.tetCount; i++) {
@@ -502,88 +588,150 @@ function createWorker(self) {
             const dx = vx - cx, dy = vy - cy, dz = vz - cz;
             data.circumradiiSq[i] = dx * dx + dy * dy + dz * dz;
         }
-    }
 
-    const planes = Array.from({ length: 6 }, () => new Float32Array(4));
-    /**
-     * Extracts the 6 frustum planes from a view-projection matrix.
-     */
-    function extractFrustumPlanes(mat) {
-        // Left, Right, Bottom, Top, Near, Far
-        for (let i = 0; i < 4; i++) planes[0][i] = mat[i*4+3] + mat[i*4+0]; // Left
-        for (let i = 0; i < 4; i++) planes[1][i] = mat[i*4+3] - mat[i*4+0]; // Right
-        for (let i = 0; i < 4; i++) planes[2][i] = mat[i*4+3] + mat[i*4+1]; // Bottom
-        for (let i = 0; i < 4; i++) planes[3][i] = mat[i*4+3] - mat[i*4+1]; // Top
-        for (let i = 0; i < 4; i++) planes[4][i] = mat[i*4+3] + mat[i*4+2]; // Near
-        for (let i = 0; i < 4; i++) planes[5][i] = mat[i*4+3] - mat[i*4+2]; // Far
-        // Normalize planes
-        for (let i = 0; i < 6; i++) {
-            const len = Math.hypot(planes[i][0], planes[i][1], planes[i][2]);
-            planes[i][0] /= len; planes[i][1] /= len; planes[i][2] /= len; planes[i][3] /= len;
-        }
+        // NEW: allocate reusable scratch now that tetCount is known
+        sizeList = new Int32Array(data.tetCount);
+        counts0 = new Uint32Array(256 * 256);
+        starts0 = new Uint32Array(256 * 256);
     }
 
     /**
      * Recalculates keys, culls primitives, and sorts the payload buffer.
      */
-    function cullAndSortTets() {
+    function cullAndSortTets(camPos) {
         if (!data.vertices) return;
+        x = camPos[0] - lastPos[0]
+        y = camPos[1] - lastPos[1]
+        z = camPos[2] - lastPos[2]
+        if ((x*x + y*y + z*z) < 0.01) return;
+        console.log(sortMode);
         console.time("sort");
+
+
+        const M = data.tetCount; // CHANGED: make constant & explicit
         let maxDepth = -Infinity;
         let minDepth = Infinity;
-        M = data.tetCount
-        let sizeList = new Int32Array(M);
+
+        // (Re)use arrays
+        if (!sizeList || sizeList.length !== M) sizeList = new Int32Array(M);
+        counts0.fill(0);
+        starts0.fill(0);
+        if (sortMode === 'f32x2') {
+          // --- Float32 keys + two 16-bit passes (stable) ---------------------------
+          for (let i = 0; i < M; i++) {
+            const cx = data.circumcenters[i * 3], cy = data.circumcenters[i * 3 + 1], cz = data.circumcenters[i * 3 + 2];
+            const dx = cx - camPos[0], dy = cy - camPos[1], dz = cz - camPos[2];
+            const floatValue = -(dx * dx + dy * dy + dz * dz - data.circumradiiSq[i]);
+            intKeys[i] = f32ToSortableU32(floatValue);
+            // payload[] was initialized to i in processTetrahedralData()
+          }
+          for (let i = 0; i < M; i++) payload[i] = i;
+
+          // two LSD passes: low 16 -> temp, high 16 -> back
+          radix16Pass(intKeys, payload, tempKeys, tempPayload, 0);
+          radix16Pass(tempKeys, tempPayload, intKeys, payload, 16);
+
+          // Ship out a pooled copy of the sorted payload
+          const depthIndex = getDepthIndexArray(M);
+          depthIndex.set(payload);
+          console.timeEnd("sort");
+          lastPos = camPos;
+          self.postMessage({ depthIndex, M }, [depthIndex.buffer]);
+
+        } else {
+          // --- Existing half16 single-pass path (unchanged) -------------------------
+          let maxDepth = -Infinity, minDepth = Infinity;
+
+          for (let i = 0; i < M; i++) {
+            const cx = data.circumcenters[i * 3], cy = data.circumcenters[i * 3 + 1], cz = data.circumcenters[i * 3 + 2];
+            const dx = cx - camPos[0], dy = cy - camPos[1], dz = cz - camPos[2];
+            let floatValue = -(dx * dx + dy * dy + dz * dz - data.circumradiiSq[i]);
+
+            const u16 = float32ToUint16(floatValue);
+            let depth = (u16 & 0x8000) ? ((~u16) & 0xFFFF) : (u16 ^ 0x8000);
+            sizeList[i] = depth;
+            if (depth > maxDepth) maxDepth = depth;
+            if (depth < minDepth) minDepth = depth;
+          }
+
+          const range = maxDepth - minDepth || 1;
+          const depthInv = (65536 - 1) / range;
+          counts0.fill(0);
+          for (let i = 0; i < M; i++) {
+            sizeList[i] = ((sizeList[i] - minDepth) * depthInv) | 0;
+            counts0[sizeList[i]]++;
+          }
+          starts0[0] = 0;
+          for (let i = 1; i < 65536; i++) starts0[i] = starts0[i - 1] + counts0[i - 1];
+
+          const depthIndex = getDepthIndexArray(M);
+          for (let i = 0; i < M; i++) depthIndex[starts0[sizeList[i]]++] = i;
+
+          console.timeEnd("sort");
+          lastPos = camPos;
+          self.postMessage({ depthIndex, M }, [depthIndex.buffer]);
+        }
+        /*
+
         for (let i = 0; i < M; i++) {
             const cx = data.circumcenters[i * 3], cy = data.circumcenters[i * 3 + 1], cz = data.circumcenters[i * 3 + 2];
             const dx = cx - camPos[0], dy = cy - camPos[1], dz = cz - camPos[2];
-            // For a back-to-front sort, we want the largest keys first.
-            // Radix sort is ascending, so we negate the key.
-            let depth = (-(dx * dx + dy * dy + dz * dz - data.circumradiiSq[i]) * 4096) | 0;
+
+            let floatValue = -(dx * dx + dy * dy + dz * dz - data.circumradiiSq[i]);
+            const uint16Value = float32ToUint16(floatValue);
+            // const uint16Value = floatToHalf(floatValue);
+
+            let depth;
+            if (uint16Value & 0x8000) {
+                depth = (~uint16Value) & 0xFFFF;
+            } else {
+                depth = uint16Value ^ 0x8000;
+            }
             sizeList[i] = depth;
             if (depth > maxDepth) maxDepth = depth;
             if (depth < minDepth) minDepth = depth;
         }
 
-        // This is a 16 bit single-pass counting sort
-        let depthInv = (256 * 256 - 1) / (maxDepth - minDepth);
-        let counts0 = new Uint32Array(256 * 256);
+        // 16-bit single-pass counting sort
+        const range = maxDepth - minDepth || 1;              // avoid div by zero
+        const depthInv = (256 * 256 - 1) / range;
         for (let i = 0; i < M; i++) {
             sizeList[i] = ((sizeList[i] - minDepth) * depthInv) | 0;
             counts0[sizeList[i]]++;
         }
-        let starts0 = new Uint32Array(256 * 256);
-        for (let i = 1; i < 256 * 256; i++)
-            starts0[i] = starts0[i - 1] + counts0[i - 1];
-        depthIndex = new Uint32Array(M);
-        for (let i = 0; i < M; i++)
-            depthIndex[starts0[sizeList[i]]++] = i;
+        for (let i = 1; i < 256 * 256; i++) starts0[i] = starts0[i - 1] + counts0[i - 1];
+
+        const depthIndex = getDepthIndexArray(M);            // NEW: pooled buffer
+        for (let i = 0; i < M; i++) depthIndex[starts0[sizeList[i]]++] = i;
 
         console.timeEnd("sort");
 
         lastPos = camPos;
-        self.postMessage({ depthIndex, M }, [
-            depthIndex.buffer,
-        ]);
+        self.postMessage({ depthIndex, M }, [depthIndex.buffer]); // transfer out
+        */
     }
-    let camPos;
-    let lastPos = [];
+
+    let sortRunning;
+
     const throttledSort = () => {
         if (!sortRunning) {
             sortRunning = true;
-            let lastPos = camPos;
-            cullAndSortTets();
+            const prev = camPos;
+            cullAndSortTets(prev);
             setTimeout(() => {
                 sortRunning = false;
-                if (lastPos !== camPos) {
-                    throttledSort();
-                }
+                if (prev !== camPos) throttledSort();
             }, 0);
         }
     };
 
-    let sortRunning;
     self.onmessage = (e) => {
-        if (e.data.fileBuffer) {
+        if (e.data.returnBuffer) {
+            // main thread returned ownership -> reuse next frame
+            outBufferPool.push(e.data.returnBuffer); // NEW
+        } else if (e.data.sortMode) {
+            sortMode = e.data.sortMode;
+        } else if (e.data.fileBuffer) {
             processTetrahedralData(e.data.fileBuffer);
             self.postMessage({
                 vertices: data.vertices,
@@ -593,11 +741,6 @@ function createWorker(self) {
                 gradients: data.gradients,
                 tetCount: data.tetCount
             }, [data.vertices.buffer, data.indices.buffer, data.densities.buffer, data.colors.buffer, data.gradients.buffer]);
-        // } else if (e.data.buffer) {
-        //     buffer = e.data.buffer;
-        //     vertexCount = e.data.vertexCount;
-        // } else if (e.data.vertexCount) {
-        //     vertexCount = e.data.vertexCount;
         } else if (e.data.camPos) {
             camPos = e.data.camPos;
             throttledSort();
@@ -605,10 +748,21 @@ function createWorker(self) {
     };
 }
 
+
 // --- Main Application Logic ---
 async function main() {
     const canvas = document.getElementById("canvas");
-    const gl = canvas.getContext("webgl2", { antialias: false });
+    // const gl = canvas.getContext("webgl2", { antialias: false });
+    const gl = canvas.getContext("webgl2", {
+      alpha: false,
+      premultipliedAlpha: false,
+      antialias: false,
+      depth: false,
+      stencil: false,
+      preserveDrawingBuffer: false,
+      desynchronized: true,
+      powerPreference: 'high-performance'
+    });
     if (!gl) { alert("WebGL 2 not supported!"); return; }
     halfFloatExt = gl.getExtension('OES_texture_half_float');
 
@@ -616,6 +770,91 @@ async function main() {
     console.log("Max Texture Size:", maxTexSize);
 
     const fpsEl = document.getElementById("fps"), tetsDrawnEl = document.getElementById("tets-drawn"), messageEl = document.getElementById("message"), spinnerEl = document.getElementById("spinner");
+
+    // --- Upscaling: dropdown UI (mobile-friendly) ------------------------------
+    const UPSCALE_CHOICES = [16, 4, 2, 1];
+
+    function getSavedUpscale() {
+      const saved = Number(localStorage.getItem('upscaleFactor'));
+      return UPSCALE_CHOICES.includes(saved) ? saved : 2; // default 2x
+    }
+    function saveUpscale(v) { localStorage.setItem('upscaleFactor', String(v)); }
+
+    // Create a small overlay with a <select>
+    function makeUpscaleDropdown(initial) {
+      const wrap = document.createElement('div');
+      wrap.style.position = 'fixed';
+      wrap.style.top = '12px';
+      wrap.style.right = '12px';
+      wrap.style.zIndex = '1000';
+      wrap.style.background = 'rgba(0,0,0,0.6)';
+      wrap.style.color = '#fff';
+      wrap.style.padding = '8px 10px';
+      wrap.style.borderRadius = '8px';
+      wrap.style.font = '12px system-ui, -apple-system, Segoe UI, Roboto, sans-serif';
+      wrap.style.display = 'flex';
+      wrap.style.gap = '8px';
+      wrap.style.alignItems = 'center';
+      wrap.style.backdropFilter = 'blur(6px)';
+
+      const label = document.createElement('label');
+      label.textContent = 'Upscale';
+      label.htmlFor = 'upscaleSelect';
+
+      const select = document.createElement('select');
+      select.id = 'upscaleSelect';
+      select.style.color = '#000';
+      select.style.borderRadius = '6px';
+      select.style.padding = '3px 6px';
+
+      [['16','16x (fastest)'], ['4','4x (fastest)'], ['2','2x'], ['1','1x (native)']].forEach(([v, txt]) => {
+        const opt = document.createElement('option');
+        opt.value = v; opt.textContent = txt;
+        select.appendChild(opt);
+      });
+      select.value = String(initial);
+
+      // Prevent canvas handlers from grabbing these events
+      ['pointerdown','mousedown','touchstart','wheel','click'].forEach(ev =>
+        wrap.addEventListener(ev, e => e.stopPropagation(), { passive: false })
+      );
+
+      select.addEventListener('change', () => {
+        upscaleFactor = Number(select.value);
+        saveUpscale(upscaleFactor);
+        resize(); // reallocate the backing buffer to new scale
+        messageEl.innerText = `Right-drag to look. WASDQE to move. (Press U to cycle)`;
+      });
+
+      wrap.append(label, select);
+      document.body.appendChild(wrap);
+      return select;
+    }
+
+    // Init value + UI
+    let upscaleFactor = getSavedUpscale();
+    const upscaleSelectEl = makeUpscaleDropdown(upscaleFactor);
+
+    // Let users cycle with 'U' and keep dropdown in sync
+    window.addEventListener('keydown', (e) => {
+      if (e.code === 'KeyU') {
+        upscaleFactor = (upscaleFactor === 4) ? 2 : (upscaleFactor === 2 ? 1 : 4);
+        saveUpscale(upscaleFactor);
+        if (upscaleSelectEl) upscaleSelectEl.value = String(upscaleFactor);
+        resize();
+        messageEl.innerText = `Upscaling: ${upscaleFactor}x — Right-drag to look. WASDQE to move. (Press U to cycle)`;
+      }
+    });
+
+    // Optional: let users cycle at runtime (press 'U')
+    window.addEventListener('keydown', (e) => {
+        if (e.code === 'KeyU') {
+            upscaleFactor = (upscaleFactor === 4) ? 2 : (upscaleFactor === 2 ? 1 : 4);
+            localStorage.setItem('upscaleFactor', String(upscaleFactor));
+            resize(); // reallocate the backing buffer
+            messageEl.innerText = `Upscaling: ${upscaleFactor}x — Right-drag to look. WASDQE to move. (Press U to cycle)`;
+        }
+    });
 
     const vshaderFileResponse = await fetch("vs.glsl");
     if (!vshaderFileResponse.ok) {
@@ -650,11 +889,10 @@ async function main() {
     gl.useProgram(program);
 
     // gl.enable(gl.PRIMITIVE_RESTART_FIXED_INDEX);
-    // gl.cullFace(gl.BACK);
+    gl.cullFace(gl.BACK);
     gl.disable(gl.DEPTH_TEST);
     gl.enable(gl.BLEND);
     gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
-    // gl.blendFuncSeparate(gl.ONE_MINUS_DST_ALPHA, gl.ONE, gl.ONE_MINUS_DST_ALPHA, gl.ONE)
 
     const u_viewProjection = gl.getUniformLocation(program, "viewProjection");
     const u_rayOrigin = gl.getUniformLocation(program, "rayOrigin");
@@ -672,11 +910,11 @@ async function main() {
     const indexBuffer = gl.createBuffer();
     // This index data defines the 4 triangle faces using the 4 base vertices
     const indexData = new Uint16Array([
-        // 0, 2, 1,   // Face 1
-        // 1, 2, 3,   // Face 2
-        // 0, 3, 2,   // Face 3
-        // 3, 0, 1    // Face 4
-        2, 3, 0, 1, 2, 3 // A different valid strip sequence
+        0, 2, 1,   // Face 1
+        1, 2, 3,   // Face 2
+        0, 3, 2,   // Face 3
+        3, 0, 1    // Face 4
+        // 2, 3, 0, 1, 2, 3 // A different valid strip sequence
         // Strip 1 (2 faces)
         // 0, 1, 2, 3,
         // // Stop this strip and start a new one
@@ -704,23 +942,37 @@ async function main() {
     gl.vertexAttribDivisor(a_tetId, 1);
 
     const verticesTexture = gl.createTexture(), indicesTexture = gl.createTexture(), densityTexture = gl.createTexture(), colorTexture = gl.createTexture(), gradientTexture = gl.createTexture();
-    
+
     let visibleCount = 0;
     const worker = new Worker(URL.createObjectURL(new Blob([`(${createWorker.toString()})(self)`], { type: "application/javascript" })));
-    
+
+    // NEW: pick sort mode via URL (?sort=f32 or ?sort=half) or default to 'half'
+    const sortParam = (new URLSearchParams(window.location.search).get('sort') || '').toLowerCase();
+    worker.postMessage({ sortMode: sortParam.startsWith('f32') ? 'f32x2' : 'half16' });
+
+    // Optional: runtime toggle with 'R'
+    window.addEventListener('keydown', (e) => {
+      if (e.code === 'KeyR') {
+        const next = (sortParam.startsWith('f32') || window.__sortMode === 'f32x2') ? 'half16' : 'f32x2';
+        window.__sortMode = next;
+        worker.postMessage({ sortMode: next });
+        messageEl.innerText = `Sort mode: ${next === 'f32x2' ? 'float32 (2-pass)' : 'half16 (1-pass)'}`;
+      }
+    });
+
     worker.onmessage = (e) => {
         if (e.data.vertices) {
             spinnerEl.style.display = 'none';
             messageEl.innerText = 'Right-drag to look. WASDQE to move.';
-            
+
             const setupTex = (tex, unit, loc, sizeLoc, internalFormat, format, type, data, elementsPerTexel) => {
                 gl.activeTexture(gl.TEXTURE0 + unit);
                 gl.bindTexture(gl.TEXTURE_2D, tex);
-                
+
                 const totalElements = data.length / elementsPerTexel;
                 const width = Math.min(totalElements, maxTexSize);
                 const height = Math.ceil(totalElements / width);
-                
+
                 const paddedSize = width * height * elementsPerTexel;
                 let paddedData = data;
                 if (data.length < paddedSize) {
@@ -734,7 +986,7 @@ async function main() {
                 gl.uniform1i(loc, unit);
                 gl.uniform2i(sizeLoc, width, height);
             };
-            
+
             setupTex(verticesTexture, 0, u_verticesTexture, u_verticesTextureSize, gl.RGB32F, gl.RGB, gl.FLOAT, e.data.vertices, 3);
             setupTex(indicesTexture, 1, u_indicesTexture, u_indicesTextureSize, gl.RGBA32UI, gl.RGBA_INTEGER, gl.UNSIGNED_INT, e.data.indices, 4);
             setupTex(densityTexture, 2, u_densityTexture, u_densityTextureSize, gl.R16F, gl.RED, gl.HALF_FLOAT, e.data.densities, 1);
@@ -745,8 +997,8 @@ async function main() {
         } else if (e.data.depthIndex) {
             visibleCount = e.data.M;
             gl.bindBuffer(gl.ARRAY_BUFFER, sortedIndexBuffer);
-            console.log(e.data.depthIndex);
             gl.bufferData(gl.ARRAY_BUFFER, e.data.depthIndex, gl.DYNAMIC_DRAW);
+            worker.postMessage({ returnBuffer: e.data.depthIndex.buffer }, [e.data.depthIndex.buffer]);
         }
         // lastSortedCameraPosition.set(camera.position);
     };
@@ -759,45 +1011,57 @@ async function main() {
     const SORT_TRIGGER_THRESHOLD_SQ = 0.01 * 0.01; // 1cm
 
     const resize = () => {
-        const dpr = window.devicePixelRatio || 1;
-        gl.canvas.width = Math.round(innerWidth * dpr);
-        gl.canvas.height = Math.round(innerHeight * dpr);
-        gl.viewport(0, 0, gl.canvas.width, gl.canvas.height);
+      // Fill window visually
+      const cssW = window.innerWidth;
+      const cssH = window.innerHeight;
+      gl.canvas.style.width = cssW + 'px';
+      gl.canvas.style.height = cssH + 'px';
+
+      // Render at lower backing resolution
+      const dpr = (window.devicePixelRatio || 1) / upscaleFactor;
+      gl.canvas.width  = Math.round(cssW * dpr);
+      gl.canvas.height = Math.round(cssH * dpr);
+
+      gl.viewport(0, 0, gl.canvas.width, gl.canvas.height);
     };
     window.addEventListener("resize", resize);
     resize();
 
+    let nextHud = 0;
+    const HUD_INTERVAL_MS = 1000;
+
     const frame = (now) => {
         const dt = (now - lastFrameTime) / 1000.0;
         lastFrameTime = now;
-        
-        const currentFps = 1 / Math.max(dt, 0.00001);
-        avgFps = currentFps;
-        fpsEl.innerText = `${Math.round(avgFps)} fps`;
-        tetsDrawnEl.innerText = `${visibleCount.toLocaleString()} tetrahedra`;
-        
+
+          if (now >= nextHud) {
+            const currentFps = 1 / Math.max(dt, 0.00001);
+            avgFps = currentFps;
+            fpsEl.innerText = `${Math.round(avgFps)} fps`;
+            tetsDrawnEl.innerText = `${visibleCount.toLocaleString()} tetrahedra`;
+            nextHud = now + HUD_INTERVAL_MS;
+          }
+
         camera.update(dt);
 
-        
+
         const viewMatrix = camera.getViewMatrix();
         const projectionMatrix = camera.getProjectionMatrix(gl.canvas.clientWidth / gl.canvas.clientHeight);
         const viewProj = multiply4(projectionMatrix, viewMatrix);
 
-        worker.postMessage({ camPos: camera.position, outputResolution: [gl.canvas.width, gl.canvas.height] });
+        worker.postMessage({ camPos: camera.position });
 
-        // worker.postMessage({ viewProj, camPos: camera.position, outputResolution: [gl.canvas.width, gl.canvas.height] });
-        
         gl.uniformMatrix4fv(u_viewProjection, false, viewProj);
         gl.uniform3fv(u_rayOrigin, camera.position);
-        
-        gl.clearColor(0.1, 0.1, 0.15, 1.0);
+
+        // gl.clearColor(0.1, 0.1, 0.15, 1.0);
         gl.clear(gl.COLOR_BUFFER_BIT);
 
         if (visibleCount > 0) {
             // gl.drawArraysInstanced(gl.TRIANGLES, 0, 12, visibleCount);
             gl.drawElementsInstanced(
-                gl.TRIANGLE_STRIP,      // mode
-                6,                // count (number of indices to draw)
+                gl.TRIANGLES,      // mode
+                12,                // count (number of indices to draw)
                 gl.UNSIGNED_SHORT, // type of data in the index buffer
                 0,                 // offset
                 visibleCount
@@ -851,13 +1115,13 @@ async function main() {
     if (fileNameFromUrl) {
         fileToLoad = `splats/${fileNameFromUrl}`;
         console.log(`Loading file from URL parameter: ${fileToLoad}`);
+        loadFile(fileToLoad);
     } else {
         // Otherwise, fall back to the default file
-        fileToLoad = "splats/room_small.splat";
-        console.log(`Loading default file: ${fileToLoad}`);
+        // fileToLoad = "splats/room_small.splat";
+        // console.log(`Loading default file: ${fileToLoad}`);
     }
 
-    loadFile(fileToLoad);
 
     frame(0);
 }

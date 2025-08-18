@@ -2,12 +2,15 @@
 precision highp float;
 const float FLT_MAX = 3.402823466e+38;
 
-in vec3 v_rayDir;
+uniform vec3 rayOrigin;
+
 flat in float v_tetDensity;
 flat in vec3 v_baseColor;
 in float v_dc_dt;
 in vec4 v_planeNumerators;
 in vec4 v_planeDenominators;
+in vec3 v_rayDir;
+in vec3 vertex;
 
 out vec4 fragColor;
 
@@ -79,7 +82,6 @@ float integrate_channel(
 
 void main () {
     float d = length(v_rayDir);
-    vec3 rayDir = v_rayDir / d;
     vec4 planeDenominators = v_planeDenominators / d;
     float dc_dt = v_dc_dt / d;
 
@@ -91,19 +93,21 @@ void main () {
 
     vec2 t = vec2(
         max(t_enter.x, max(t_enter.y, max(t_enter.z, t_enter.w))),
+        // length(vertex - rayOrigin)
+        // v_distance,
         min(t_exit.x, min(t_exit.y, min(t_exit.z, t_exit.w)))
     );
 
     opticalDepth *= t.y - t.x;
     float T = exp(-opticalDepth);
-    vec3 c_start = v_baseColor + dc_dt * t.x;
-    vec3 c_end   = v_baseColor + dc_dt * t.y;
-    vec3 C = compute_integral(c_start, c_end, opticalDepth);
+    // vec3 c_start = v_baseColor + dc_dt * t.x;
+    // vec3 c_end   = v_baseColor + dc_dt * t.y;
+    // vec3 C = compute_integral(c_start, c_end, opticalDepth);
     fragColor = vec4(
-        // integrate_channel(t.x, t.y, v_baseColor.r, dc_dt, v_tetDensity),
-        // integrate_channel(t.x, t.y, v_baseColor.g, dc_dt, v_tetDensity),
-        // integrate_channel(t.x, t.y, v_baseColor.b, dc_dt, v_tetDensity),
-        C.r, C.g, C.b,
+        integrate_channel(t.x, t.y, v_baseColor.r, dc_dt, v_tetDensity),
+        integrate_channel(t.x, t.y, v_baseColor.g, dc_dt, v_tetDensity),
+        integrate_channel(t.x, t.y, v_baseColor.b, dc_dt, v_tetDensity),
+        // C.r, C.g, C.b,
         // v_baseColor.r,
         // v_baseColor.g,
         // v_baseColor.b,

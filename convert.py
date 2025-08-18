@@ -7,6 +7,7 @@ import numpy as np
 import argparse
 from io import BytesIO
 import matplotlib.pyplot as plt
+from pathlib import Path
 
 C0 = 0.28209479177387814
 C1 = 0.4886025119029199
@@ -65,19 +66,43 @@ def eval_sh(deg: int, sh, dirs):
     result = 0.28209479177387814 * sh[..., 0] + 0.5
     if deg > 0:
         x, y, z = dirs[..., 0:1], dirs[..., 1:2], dirs[..., 2:3]
-        result = (result - 0.4886025119029199 * y * sh[..., 1] + 0.4886025119029199 * z * sh[..., 2] - 0.4886025119029199 * x * sh[..., 3])
+        result = (result -
+                0.4886025119029199 * y * sh[..., 1] +
+                0.4886025119029199 * z * sh[..., 2] -
+                0.4886025119029199 * x * sh[..., 3])
 
         if deg > 1:
             xx, yy, zz = x * x, y * y, z * z
             xy, yz, xz = x * y, y * z, x * z
-            result = (result + 1.0925484305920792 * xy * sh[..., 4] + -1.0925484305920792 * yz * sh[..., 5] + 0.31539156525252005 * (2.0 * zz - xx - yy) * sh[..., 6] + -1.0925484305920792 * xz * sh[..., 7] + 0.5462742152960396 * (xx - yy) * sh[..., 8])
+            result = (result +
+                    1.0925484305920792 * xy * sh[..., 4] +
+                    -1.0925484305920792 * yz * sh[..., 5] +
+                    0.31539156525252005 * (2.0 * zz - xx - yy) * sh[..., 6] +
+                    -1.0925484305920792 * xz * sh[..., 7] +
+                    0.5462742152960396 * (xx - yy) * sh[..., 8])
 
             if deg > 2:
-                result = (result + -0.5900435899266435 * y * (3 * xx - yy) * sh[..., 9] + 2.890611442640554 * xy * z * sh[..., 10] + -0.4570457994644658 * y * (4 * zz - xx - yy)* sh[..., 11] + 0.3731763325901154 * z * (2 * zz - 3 * xx - 3 * yy) * sh[..., 12] + -0.4570457994644658 * x * (4 * zz - xx - yy) * sh[..., 13] + 1.445305721320277 * z * (xx - yy) * sh[..., 14] + -0.5900435899266435 * x * (xx - 3 * yy) * sh[..., 15])
+                result = (result +
+                -0.5900435899266435 * y * (3 * xx - yy) * sh[..., 9] +
+                2.890611442640554 * xy * z * sh[..., 10] +
+                -0.4570457994644658 * y * (4 * zz - xx - yy)* sh[..., 11] +
+                0.3731763325901154 * z * (2 * zz - 3 * xx - 3 * yy) * sh[..., 12] +
+                -0.4570457994644658 * x * (4 * zz - xx - yy) * sh[..., 13] +
+                1.445305721320277 * z * (xx - yy) * sh[..., 14] +
+                -0.5900435899266435 * x * (xx - 3 * yy) * sh[..., 15])
 
                 if deg > 3:
-                    result = (result + 2.5033429417967046 * xy * (xx - yy) * sh[..., 16] + -1.7701307697799304 * yz * (3 * xx - yy) * sh[..., 17] + 0.9461746957575601 * xy * (7 * zz - 1) * sh[..., 18] + -0.6690465435572892 * yz * (7 * zz - 3) * sh[..., 19] + 0.10578554691520431 * (zz * (35 * zz - 30) + 3) * sh[..., 20] + -0.6690465435572892 * xz * (7 * zz - 3) * sh[..., 21] + 0.47308734787878004 * (xx - yy) * (7 * zz - 1) * sh[..., 22] + -1.7701307697799304 * xz * (xx - 3 * yy) * sh[..., 23] + 0.6258357354491761 * (xx * (xx - 3 * yy) - yy * (3 * xx - yy)) * sh[..., 24])
+                    result = (result + 2.5033429417967046 * xy * (xx - yy) * sh[..., 16] +
+                            -1.7701307697799304 * yz * (3 * xx - yy) * sh[..., 17] +
+                            0.9461746957575601 * xy * (7 * zz - 1) * sh[..., 18] +
+                            -0.6690465435572892 * yz * (7 * zz - 3) * sh[..., 19] +
+                            0.10578554691520431 * (zz * (35 * zz - 30) + 3) * sh[..., 20] +
+                            -0.6690465435572892 * xz * (7 * zz - 3) * sh[..., 21] +
+                            0.47308734787878004 * (xx - yy) * (7 * zz - 1) * sh[..., 22] +
+                            -1.7701307697799304 * xz * (xx - 3 * yy) * sh[..., 23] +
+                            0.6258357354491761 * (xx * (xx - 3 * yy) - yy * (3 * xx - yy)) * sh[..., 24])
     return result
+
 
 def load_sh(tetra_dict):
     sh_names = [k for k in tetra_dict.keys() if k.startswith("sh_")]
@@ -119,7 +144,7 @@ def calculate_circumcenters(vertices):
     denominator = 2.0 * np.sum(a * cross_bc, axis=-1, keepdims=True)
     
     # Create mask for small denominators
-    mask = np.abs(denominator) < 1e-6
+    mask = np.abs(denominator) < 1e-12
     
     # Compute circumcenter relative to verts[0]
     relative_circumcenter = (
@@ -134,7 +159,21 @@ def calculate_circumcenters(vertices):
     # Return absolute position
     return vertices[..., 0, :] + relative_circumcenter, radius
 
+def tet_volumes(tets):
+    v0 = tets[:, 0]
+    v1 = tets[:, 1]
+    v2 = tets[:, 2]
+    v3 = tets[:, 3]
 
+    a = v1 - v0
+    b = v2 - v0
+    c = v3 - v0
+    
+    mat = np.stack((a, b, c), axis=1)
+    det = np.linalg.det(mat)
+    
+    vol = det / 6.0
+    return vol
 
 def process_ply_to_splat(ply_file_path):
     data = tinyplypy.read_ply(ply_file_path)
@@ -144,23 +183,31 @@ def process_ply_to_splat(ply_file_path):
     M = indices.shape[0]
 
     tets = vertices[indices]
-    circumcenters, radius = calculate_circumcenters(tets)
+    cam1 = np.array([-4.0668, -0.5194,  0.9773]).reshape(1, 3)
+    cam1 = np.array([ 4.1367, -0.5304,  1.0696]).reshape(1, 3)
+    circumcenters, radius = calculate_circumcenters(tets.astype(np.double))
+    circumcenters = circumcenters.astype(np.float32)
+    centroid = tets.mean(axis=1)
+    # dirs = -(vertices.mean(axis=0, keepdims=True) - centroid)
+    dirs = -(cam1 - centroid)
+    dirs = dirs / np.linalg.norm(dirs, axis=1, keepdims=True)
 
     # density_i = np.log(data['tetrahedron']['s'])*20+100
     # density_i[density_i<=1] = 0
     # density_t = np.clip(density_i, 0, 255).astype(np.uint8)
-    density_t = data['tetrahedron']['s'].astype(np.float16)
-
+    s = data['tetrahedron']['s']
+    s[np.isnan(s)] = 0
+    density_t = s.astype(np.float16)
 
     grd = np.stack([data['tetrahedron']['grd_x'], data['tetrahedron']['grd_y'], data['tetrahedron']['grd_z']], axis=1)
-    # grd_t = np.clip(127 * (np.sign(grd) * np.sqrt(np.abs(grd))+1), 0, 255).astype(np.uint8)
     grd_t = grd.astype(np.float16)
 
     offset = np.sum(grd * (tets[:, 0] - circumcenters), axis=1, keepdims=True)
 
-    # compress colors. TODO: use a better direction for better colors. Like from the center of the scene to the centroids
+    # compress colors
     sh_dat = load_sh(data['tetrahedron'])
-    colors = eval_sh(3, np.transpose(sh_dat, (0, 2, 1)), np.array([1, 0, 0]).reshape(1, 3))
+    # colors = eval_sh(3, np.transpose(sh_dat, (0, 2, 1)), np.array([1, 0, 0]).reshape(1, 3))#dirs)
+    colors = eval_sh(3, np.transpose(sh_dat, (0, 2, 1)), dirs)
     sp_colors = 0.1*np.log(1+np.exp(10*colors)) + offset
     # plt.hist(sp_colors, bins=50)
     # plt.show()

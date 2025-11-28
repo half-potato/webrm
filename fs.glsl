@@ -69,7 +69,7 @@ void main () {
         min(t_exit.x, min(t_exit.y, min(t_exit.z, t_exit.w)))
     );
 
-    opticalDepth *= t.y - t.x;
+    opticalDepth *= max(t.y - t.x, 0.f);
 
     vec3 N = v_rayDir / d;
     vec3 pos_enter = rayOrigin + N * t.x;

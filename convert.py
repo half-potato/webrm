@@ -198,7 +198,8 @@ def process_ply_to_rmesh(ply_file_path):
 
     tets = vertices[indices]
     cam1 = np.array([-4.0668, -0.5194,  0.9773]).reshape(1, 3)
-    cam1 = np.array([ 4.1367, -0.5304,  1.0696]).reshape(1, 3)
+    # cam1 = np.array([ 4.1367, -0.5304,  1.0696]).reshape(1, 3)
+    cam1 = np.array([ 0.0, 3.0, -3.0]).reshape(1, 3)
     circumcenters, radius = calculate_circumcenters(tets.astype(np.double))
     circumcenters = circumcenters.astype(np.float32)
     centroid = tets.mean(axis=1)

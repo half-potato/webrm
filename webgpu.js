@@ -1023,7 +1023,7 @@ async function main() {
         if (e.data.vertices) {
 
             spinnerEl.style.display = 'none';
-            messageEl.innerText = 'WebGPU Ready. Right-drag to look. WASDQE to move.';
+            messageEl.innerText = 'Right-drag to look. Press M to enable WASDQE.';
             tetCount = e.data.tetCount;
             const numVerts = e.data.vertices.length / 3;
 

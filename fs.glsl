@@ -11,6 +11,8 @@ in vec4 v_planeNumerators;
 in vec4 v_planeDenominators;
 in vec3 v_rayDir;
 in vec3 vertex;
+flat in vec3 v_tetAnchor; 
+flat in vec3 v_grad;
 
 out vec4 fragColor;
 
@@ -34,57 +36,27 @@ const uvec3 kTetTriangles[4] = uvec3[4](
     uvec3(3, 0, 1)
 );
 
-vec4 compute_integral(vec3 c0, vec3 c1, float d_dt) {
-    float alpha = exp(-d_dt);
-    float X = (-d_dt*alpha + 1.f - alpha);
-    float Y = (d_dt-1.f) + alpha;
-    vec3 C = (X*c0+Y*c1) / d_dt;
-    return vec4(C.x, C.y, C.z, 1.f-alpha);
-}
 
-float compute_integral_1D(float c0, float c1, float d_dt) {
-    float alpha = exp(-d_dt);
-    float X = (-d_dt*alpha + 1.f - alpha);
-    float Y = (d_dt-1.f) + alpha;
-    return (X*c0+Y*c1) / d_dt;
-}
-
-float integrate_channel(
-    float t_n, float t_f,
-    float c_at_t0, float dc_dt, float density)
-{
-
-    // Find where the linear color function C(t) would cross zero.
-    float t_zero = clamp(-(c_at_t0 / dc_dt), t_n, t_f);
-
-    // Determine the start and end of the segment where C(t) > 0.
-    // This replaces the main "if (change_within)" and nested branches.
-    float t_start = (dc_dt > 0.0f) ? t_zero : t_n;
-    float t_end   = (dc_dt < 0.0f) ? t_zero : t_f;
-
-    // Clamp this "positive" segment to the actual integration bounds [t_n, t_f].
-    float dt_pos_segment = t_end - t_start;
-    float d_dt = dt_pos_segment * density;
-    if (d_dt < 1e-3f) {
-        return 0.f;
+float phi(float x) {
+    if (abs(x) < 1e-6) {
+        return 1.0f - x / 2.0f;
     }
+    return (1.0f - exp(-x)) / x;
+}
 
-    // Calculate transmittance through the initial "zero-color" segment [t_n, t_start].
-    float dt_zero_segment = t_start - t_n;
-    float T_zero_segment = exp(-density * dt_zero_segment);
-
-    // Calculate the integral over the clamped positive segment [t_start, t_end].
-    float c_start = c_at_t0 + dc_dt * t_start;
-    float c_end   = c_at_t0 + dc_dt * t_end;
-
-    // The final result is the attenuated integral over the positive part.
-    return T_zero_segment * compute_integral_1D(c_end, c_start, d_dt);
+vec4 compute_integral(vec3 c0, vec3 c1, float ddt) {
+    float alpha = exp(-ddt);
+    float phi_val = phi(ddt);
+    float w0 = phi_val - alpha;
+    float w1 = 1.0f - phi_val;
+    vec3 C = w0 * c0 + w1 * c1;
+    return vec4(C.x, C.y, C.z, 1.f-alpha);
 }
 
 void main () {
     float d = length(v_rayDir);
     vec4 planeDenominators = v_planeDenominators / d;
-    float dc_dt = v_dc_dt / d;
+    // float dc_dt = v_dc_dt / d;
 
     float opticalDepth = v_tetDensity;
     vec4 all_t = v_planeNumerators / planeDenominators;
@@ -94,30 +66,20 @@ void main () {
 
     vec2 t = vec2(
         max(t_enter.x, max(t_enter.y, max(t_enter.z, t_enter.w))),
-        // length(vertex - rayOrigin)
-        // v_distance,
         min(t_exit.x, min(t_exit.y, min(t_exit.z, t_exit.w)))
     );
 
     opticalDepth *= t.y - t.x;
-    //float T = exp(-opticalDepth);
-    // vec3 c_start = v_baseColor + dc_dt * t.x;
-    // vec3 c_end   = v_baseColor + dc_dt * t.y;
-    // vec3 C = compute_integral(c_start, c_end, opticalDepth);
-    vec3 c_start = max(v_baseColor + dc_dt * t.x, 0.f);
-    vec3 c_end = max(v_baseColor + dc_dt * t.y, 0.f);
+
+    vec3 N = v_rayDir / d;
+    vec3 pos_enter = rayOrigin + N * t.x;
+    vec3 local_diff = pos_enter - v_tetAnchor;
+    float local_offset = dot(v_grad, local_diff);
+    vec3 c_start = max(v_baseColor + local_offset, 0.0f);
+    float dc_dt = dot(v_grad, N); // Change in color per unit of ray length
+    vec3 c_end   = max(c_start + dc_dt * (t.y-t.x), 0.0f);
+
+    // vec3 c_start = max(v_baseColor + dc_dt * t.x, 0.f);
+    // vec3 c_end = max(v_baseColor + dc_dt * t.y, 0.f);
     fragColor = compute_integral(c_end, c_start, opticalDepth);
-
-
-    /*
-    fragColor = vec4(
-        integrate_channel(t.x, t.y, v_baseColor.r, dc_dt, v_tetDensity),
-        integrate_channel(t.x, t.y, v_baseColor.g, dc_dt, v_tetDensity),
-        integrate_channel(t.x, t.y, v_baseColor.b, dc_dt, v_tetDensity),
-        // C.r, C.g, C.b,
-        // v_baseColor.r,
-        // v_baseColor.g,
-        // v_baseColor.b,
-        1.f-T);
-    */
 }

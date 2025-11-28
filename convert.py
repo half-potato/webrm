@@ -184,7 +184,7 @@ def process_ply_to_rmesh(ply_file_path):
     vertices = np.stack([data['vertex']['x'], data['vertex']['y'], data['vertex']['z']], axis=1)
     indices = data['tetrahedron']['indices']
     s = data['tetrahedron']['s']
-    mask = np.isnan(s) | (s < 1e-1)
+    mask = np.isnan(s)
 
     grd = np.stack([data['tetrahedron']['grd_x'], data['tetrahedron']['grd_y'], data['tetrahedron']['grd_z']], axis=1)
     sh_dat = load_sh(data['tetrahedron'])
@@ -214,7 +214,7 @@ def process_ply_to_rmesh(ply_file_path):
 
     grd_t = grd.astype(np.float16)
 
-    offset = np.sum(grd * (tets[:, 0] - circumcenters), axis=1, keepdims=True)
+    offset = np.sum(grd * (tets[:, 0] - centroid), axis=1, keepdims=True)
 
     # compress colors
     # colors = eval_sh(3, np.transpose(sh_dat, (0, 2, 1)), np.array([1, 0, 0]).reshape(1, 3))#dirs)

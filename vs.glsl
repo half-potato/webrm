@@ -28,6 +28,8 @@ out vec4 v_planeNumerators;
 out vec4 v_planeDenominators;
 out vec3 v_rayDir;
 out vec3 vertex;
+flat out vec3 v_tetAnchor; 
+flat out vec3 v_grad;
 
 ivec2 getTexCoord(uint id, ivec2 size) {
     return ivec2(id % uint(size.x), id / uint(size.x));
@@ -58,14 +60,16 @@ void main () {
 
     ivec2 gradCoord = getTexCoord(tetId, gradientTextureSize);
     vec3 grad = texelFetch(gradientTexture, gradCoord, 0).rgb;
+    v_grad = grad;
+    v_tetAnchor = verts[0];
 
     float offset2 = dot(rayOrigin - verts[0], grad);
 
     ivec2 colorCoord = getTexCoord(tetId, colorTextureSize);
     vec3 base_color_from_texture = texelFetch(colorTexture, colorCoord, 0).rgb;
-    v_baseColor = base_color_from_texture + offset2;
+    v_baseColor = base_color_from_texture;// + offset2;
 
-    v_dc_dt = dot(grad, v_rayDir);
+    // v_dc_dt = dot(grad, v_rayDir);
 
     // Re-create kTetTriangles logic locally for plane calculations
     const uvec3 kTetPlanes[4] = uvec3[4](
@@ -81,4 +85,3 @@ void main () {
 
     gl_Position = viewProjection * vec4(worldPos, 1.0);
 }
-

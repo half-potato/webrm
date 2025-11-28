@@ -55,7 +55,7 @@ function invert4(a) {
 
 
 class Camera {
-    constructor(position = [0, 5, 2], canvas) {
+    constructor(position = [0, 5, -2], canvas) {
         this.canvas = canvas;
 
         // General properties

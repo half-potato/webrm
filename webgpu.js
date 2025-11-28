@@ -6,11 +6,11 @@ struct Uniforms {
 };
 
 @group(0) @binding(0) var<uniform> uniforms: Uniforms;
-@group(0) @binding(1) var<storage, read> vertices: array<f32>;
+@group(0) @binding(1) var<storage, read> vertices: array<f32>; 
 @group(0) @binding(2) var<storage, read> indices: array<u32>;
 @group(0) @binding(3) var<storage, read> densities: array<f32>;
 @group(0) @binding(4) var<storage, read> colors: array<f32>;
-@group(0) @binding(5) var<storage, read> gradients: array<f32>; // Packed as vec3 floats
+@group(0) @binding(5) var<storage, read> gradients: array<f32>;
 @group(0) @binding(6) var<storage, read> sortedIndices: array<u32>;
 
 struct VertexOutput {
@@ -33,17 +33,19 @@ const kTetFaceIndices = array<u32, 12>(
     3u, 0u, 1u
 );
 
-// Helper to manual fetch from f32 arrays as vec3
-fn getVertex(idx: u32) -> vec3<f32> {
-    return vec3<f32>(vertices[idx*3u], vertices[idx*3u+1u], vertices[idx*3u+2u]);
+fn getVertex(index: u32) -> vec3<f32> {
+    let i = index * 3u;
+    return vec3<f32>(vertices[i], vertices[i+1u], vertices[i+2u]);
 }
 
-fn getGradient(idx: u32) -> vec3<f32> {
-    return vec3<f32>(gradients[idx*3u], gradients[idx*3u+1u], gradients[idx*3u+2u]);
+fn getColor(tetId: u32) -> vec3<f32> {
+    let i = tetId * 3u;
+    return vec3<f32>(colors[i], colors[i+1u], colors[i+2u]);
 }
 
-fn getColor(idx: u32) -> vec3<f32> {
-    return vec3<f32>(colors[idx*3u], colors[idx*3u+1u], colors[idx*3u+2u]);
+fn getGradient(tetId: u32) -> vec3<f32> {
+    let i = tetId * 3u;
+    return vec3<f32>(gradients[i], gradients[i+1u], gradients[i+2u]);
 }
 
 @vertex
@@ -218,6 +220,20 @@ function invert4(a) {
     out[14] = (a31 * b01 - a30 * b03 - a32 * b00) * det;
     out[15] = (a20 * b03 - a21 * b01 + a22 * b00) * det;
     return out;
+}
+
+function decodeHalf(float16bits) {
+    const exponent = (float16bits & 0x7C00) >> 10;
+    const fraction = float16bits & 0x03FF;
+    const sign = (float16bits & 0x8000) ? -1 : 1;
+
+    if (exponent === 0) {
+        return sign * Math.pow(2, -14) * (fraction / 1024);
+    } else if (exponent === 0x1F) {
+        return fraction ? NaN : sign * Infinity;
+    }
+
+    return sign * Math.pow(2, exponent - 15) * (1 + (fraction / 1024));
 }
 
 
@@ -1005,53 +1021,73 @@ async function main() {
     // Handle incoming data from worker
     worker.onmessage = (e) => {
         if (e.data.vertices) {
+
             spinnerEl.style.display = 'none';
             messageEl.innerText = 'WebGPU Ready. Right-drag to look. WASDQE to move.';
             tetCount = e.data.tetCount;
+            const numVerts = e.data.vertices.length / 3;
 
-            // Helper to create buffers
-            const createStorage = (arr) => {
-                const buf = device.createBuffer({
-                    size: arr.byteLength,
+            // Helper to create valid WebGPU buffers
+            function createStorageBuffer(device, typedArray) {
+                const buffer = device.createBuffer({
+                    size: typedArray.byteLength,
                     usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
                     mappedAtCreation: true
                 });
-                new (arr.constructor)(buf.getMappedRange()).set(arr);
-                buf.unmap();
-                return buf;
-            };
+                // We must use the correct View constructor based on input
+                if (typedArray instanceof Uint32Array) {
+                    new Uint32Array(buffer.getMappedRange()).set(typedArray);
+                } else {
+                    new Float32Array(buffer.getMappedRange()).set(typedArray);
+                }
+                buffer.unmap();
+                return buffer;
+            }
 
-            // NOTE: WGSL assumes f32 for easy math, but we need to match data types
-            // For highest performance, we assume the worker sends Float32 for vertices.
-            // Density (Uint16) and Colors (Uint8) need careful handling or conversion.
-            // For simplicity in this upgrade, we convert tight packed formats to f32 on upload 
-            // to simplify the shader logic, though raw reading is possible.
-            
-            vertexBuffer = createStorage(e.data.vertices);
-            indexBuffer = createStorage(e.data.indices); // Uint32
-            
-            // Expand densities to F32 for easier shader consumption
-            const denF32 = new Float32Array(e.data.densities.length);
-            for(let i=0; i<e.data.densities.length; i++) denF32[i] = e.data.densities[i];
-            densityBuffer = createStorage(denF32);
+            // --- 1. Vertices (Already Float32, just copy) ---
+            vertexBuffer = createStorageBuffer(device, e.data.vertices);
 
-            // Expand colors to F32 (0-1 range)
-            const colF32 = new Float32Array(e.data.colors.length);
-            for(let i=0; i<e.data.colors.length; i++) colF32[i] = e.data.colors[i] / 255.0;
-            colorBuffer = createStorage(colF32);
+            // --- 2. Indices (Already Uint32, just copy) ---
+            indexBuffer = createStorageBuffer(device, e.data.indices);
 
-            gradientBuffer = createStorage(e.data.gradients); // Already f16/f32 usually
+            // --- 3. Densities (Uint16 Half-Float -> Float32) ---
+            // The shader expects a standard float. We convert here.
+            const denRaw = e.data.densities; // Uint16Array
+            const denF32 = new Float32Array(denRaw.length);
+            for (let i = 0; i < denRaw.length; i++) {
+                denF32[i] = decodeHalf(denRaw[i]); 
+                // Note: If your data is actually just normalized integers (0-65535 mapped to 0-1), 
+                // use: denRaw[i] / 65535.0; instead. 
+                // But based on your previous code using gl.HALF_FLOAT, decodeHalf is correct.
+            }
+            densityBuffer = createStorageBuffer(device, denF32);
 
-            // Pre-allocate sorted index buffer
+            // --- 4. Colors (Uint8 RGB -> Float32 Normalized) ---
+            // WebGL normalized this auto; WebGPU storage buffers don't.
+            const colRaw = e.data.colors; // Uint8Array
+            const colF32 = new Float32Array(colRaw.length);
+            for (let i = 0; i < colRaw.length; i++) {
+                colF32[i] = colRaw[i] / 255.0; // Normalize to 0.0 - 1.0
+            }
+            colorBuffer = createStorageBuffer(device, colF32);
+
+            // --- 5. Gradients (Uint16 Half-Float -> Float32) ---
+            const gradRaw = e.data.gradients; // Uint16Array
+            const gradF32 = new Float32Array(gradRaw.length);
+            for (let i = 0; i < gradRaw.length; i++) {
+                gradF32[i] = decodeHalf(gradRaw[i]);
+            }
+            gradientBuffer = createStorageBuffer(device, gradF32);
+
+            // --- 6. Sorted Index Buffer (Pre-allocate) ---
             sortedIndexBuffer = device.createBuffer({
-                size: tetCount * 4,
+                size: tetCount * 4, // 4 bytes per index (u32)
                 usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST
             });
-            
-            // Initial BindGroup (will be recreated if buffers change, but they are static mostly)
+
             createBindGroup();
 
-        } else if (e.data.depthIndex) {
+        } else if (e.data.depthIndex && sortedIndexBuffer) {
             visibleCount = e.data.M;
             // Upload sorted indices
             device.queue.writeBuffer(sortedIndexBuffer, 0, e.data.depthIndex, 0, visibleCount);

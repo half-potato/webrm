@@ -1114,7 +1114,6 @@ async function main() {
 
     // --- Rendering ---
     const camera = new Camera([0, 3, -3], canvas);
-    let lastFrameTime = 0;
     
     // Resize Observer
     const resize = () => {
@@ -1129,13 +1128,31 @@ async function main() {
     window.addEventListener("resize", resize);
     resize();
 
+    let frameCount = 0;
+    let lastHudTime = 0;
+    let lastFrameTime = performance.now();
+
     const frame = (now) => {
+
         const dt = (now - lastFrameTime) / 1000.0;
         lastFrameTime = now;
-        
-        // Update Stats
-        fpsEl.innerText = `${Math.round(1/dt)} fps`;
-        tetsDrawnEl.innerText = `${visibleCount.toLocaleString()} tets`;
+
+        // --- IMPROVED FPS COUNTER ---
+        frameCount++;
+        const timeSinceHud = now - lastHudTime;
+
+        // Update HUD every 1000ms (1 second)
+        if (timeSinceHud >= 1000) {
+            // Calculate average FPS over the specific time interval
+            const fps = Math.round((frameCount * 1000) / timeSinceHud);
+            
+            fpsEl.innerText = `${fps} fps`;
+            tetsDrawnEl.innerText = `${visibleCount.toLocaleString()} tets`;
+
+            // Reset counters
+            frameCount = 0;
+            lastHudTime = now;
+        }
 
         camera.update(dt);
         const aspect = canvas.width / canvas.height;

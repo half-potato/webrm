@@ -54,6 +54,7 @@ void main () {
 
     ivec2 densityCoord = getTexCoord(tetId, densityTextureSize);
     v_tetDensity = texelFetch(densityTexture, densityCoord, 0).r;
+    //v_tetDensity = exp((texelFetch(densityTexture, densityCoord, 0).r - 100)/20);
 
     ivec2 gradCoord = getTexCoord(tetId, gradientTextureSize);
     vec3 grad = texelFetch(gradientTexture, gradCoord, 0).rgb;

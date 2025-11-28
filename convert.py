@@ -1,5 +1,5 @@
-# You can use this to convert a .ply file to a .splat file programmatically in python
-# Alternatively you can drag and drop a .ply file into the viewer at https://antimatter15.com/splat
+# You can use this to convert a .ply file to a .rmesh file programmatically in python
+# Alternatively you can drag and drop a .ply file into the viewer at https://antimatter15.com/rmesh
 
 import tinyplypy
 from plyfile import PlyData
@@ -8,6 +8,7 @@ import argparse
 from io import BytesIO
 import matplotlib.pyplot as plt
 from pathlib import Path
+import gzip
 
 C0 = 0.28209479177387814
 C1 = 0.4886025119029199
@@ -175,10 +176,23 @@ def tet_volumes(tets):
     vol = det / 6.0
     return vol
 
-def process_ply_to_splat(ply_file_path):
+def softplus(x, b=10):
+    return 0.1*np.log(1+np.exp(10*x))
+
+def process_ply_to_rmesh(ply_file_path):
     data = tinyplypy.read_ply(ply_file_path)
     vertices = np.stack([data['vertex']['x'], data['vertex']['y'], data['vertex']['z']], axis=1)
-    indices = data['tetrahedron']['vertex_indices']
+    indices = data['tetrahedron']['indices']
+    s = data['tetrahedron']['s']
+    mask = np.isnan(s) | (s < 1e-1)
+
+    grd = np.stack([data['tetrahedron']['grd_x'], data['tetrahedron']['grd_y'], data['tetrahedron']['grd_z']], axis=1)
+    sh_dat = load_sh(data['tetrahedron'])
+    s = s[~mask]
+    grd = grd[~mask]
+    sh_dat = sh_dat[~mask]
+    indices = indices[~mask]
+
     N = vertices.shape[0]
     M = indices.shape[0]
 
@@ -192,27 +206,26 @@ def process_ply_to_splat(ply_file_path):
     dirs = -(cam1 - centroid)
     dirs = dirs / np.linalg.norm(dirs, axis=1, keepdims=True)
 
-    # density_i = np.log(data['tetrahedron']['s'])*20+100
-    # density_i[density_i<=1] = 0
-    # density_t = np.clip(density_i, 0, 255).astype(np.uint8)
-    s = data['tetrahedron']['s']
-    s[np.isnan(s)] = 0
     density_t = s.astype(np.float16)
 
-    grd = np.stack([data['tetrahedron']['grd_x'], data['tetrahedron']['grd_y'], data['tetrahedron']['grd_z']], axis=1)
+    # density_i = np.log(s)*20+100
+    # density_i[density_i<=1] = 0
+    # density_t = np.clip(density_i, 0, 255).astype(np.uint8)
+
     grd_t = grd.astype(np.float16)
 
     offset = np.sum(grd * (tets[:, 0] - circumcenters), axis=1, keepdims=True)
 
     # compress colors
-    sh_dat = load_sh(data['tetrahedron'])
     # colors = eval_sh(3, np.transpose(sh_dat, (0, 2, 1)), np.array([1, 0, 0]).reshape(1, 3))#dirs)
     colors = eval_sh(3, np.transpose(sh_dat, (0, 2, 1)), dirs)
-    sp_colors = 0.1*np.log(1+np.exp(10*colors)) + offset
+    # sp_colors = 0.1*np.log(1+np.exp(10*colors)) + offset
+    sp_colors = softplus(colors + offset)
     # plt.hist(sp_colors, bins=50)
     # plt.show()
     # rgb_t = ((sp_colors/4+0.5)*65535).clip(0, 65535).astype(np.uint16)
-    rgb_t = sp_colors.astype(np.float16)
+    # rgb_t = sp_colors.astype(np.float16)
+    rgb_t = (sp_colors*255).clip(0, 255).astype(np.uint8)
 
     buffer = BytesIO()
     buffer.write(np.array([N, M]).astype(np.uint32).tobytes())
@@ -224,12 +237,15 @@ def process_ply_to_splat(ply_file_path):
     buffer.write(grd_t.tobytes())
     buffer.write(circumcenters.tobytes())
 
-    return buffer.getvalue()
+    compressed_bytes = gzip.compress(buffer.getvalue(), compresslevel=9)
+    return compressed_bytes
+
+    # return buffer.getvalue()
 
 
-def save_splat_file(splat_data, output_path):
+def save_rmesh_file(rmesh_data, output_path):
     with open(output_path, "wb") as f:
-        f.write(splat_data)
+        f.write(rmesh_data)
 
 
 def main():
@@ -238,16 +254,16 @@ def main():
         "input_files", nargs="+", help="The input PLY files to process."
     )
     parser.add_argument(
-        "--output", "-o", default="output.splat", help="The output SPLAT file."
+        "--output", "-o", default="output.rmesh", help="The output RMESH file."
     )
     args = parser.parse_args()
     for input_file in args.input_files:
         print(f"Processing {input_file}...")
-        splat_data = process_ply_to_splat(input_file)
+        rmesh_data = process_ply_to_rmesh(input_file)
         output_file = (
-            args.output if len(args.input_files) == 1 else input_file + ".dsplat"
+            args.output if len(args.input_files) == 1 else input_file + ".rmesh"
         )
-        save_splat_file(splat_data, output_file)
+        save_rmesh_file(rmesh_data, output_file)
         print(f"Saved {output_file}")
 
 

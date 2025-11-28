@@ -34,11 +34,12 @@ const uvec3 kTetTriangles[4] = uvec3[4](
     uvec3(3, 0, 1)
 );
 
-vec3 compute_integral(vec3 c0, vec3 c1, float d_dt) {
+vec4 compute_integral(vec3 c0, vec3 c1, float d_dt) {
     float alpha = exp(-d_dt);
     float X = (-d_dt*alpha + 1.f - alpha);
     float Y = (d_dt-1.f) + alpha;
-    return (X*c0+Y*c1) / d_dt;
+    vec3 C = (X*c0+Y*c1) / d_dt;
+    return vec4(C.x, C.y, C.z, 1.f-alpha);
 }
 
 float compute_integral_1D(float c0, float c1, float d_dt) {
@@ -99,10 +100,16 @@ void main () {
     );
 
     opticalDepth *= t.y - t.x;
-    float T = exp(-opticalDepth);
+    //float T = exp(-opticalDepth);
     // vec3 c_start = v_baseColor + dc_dt * t.x;
     // vec3 c_end   = v_baseColor + dc_dt * t.y;
     // vec3 C = compute_integral(c_start, c_end, opticalDepth);
+    vec3 c_start = max(v_baseColor + dc_dt * t.x, 0.f);
+    vec3 c_end = max(v_baseColor + dc_dt * t.y, 0.f);
+    fragColor = compute_integral(c_end, c_start, opticalDepth);
+
+
+    /*
     fragColor = vec4(
         integrate_channel(t.x, t.y, v_baseColor.r, dc_dt, v_tetDensity),
         integrate_channel(t.x, t.y, v_baseColor.g, dc_dt, v_tetDensity),
@@ -112,4 +119,5 @@ void main () {
         // v_baseColor.g,
         // v_baseColor.b,
         1.f-T);
+    */
 }

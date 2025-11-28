@@ -561,8 +561,8 @@ function createWorker(self) {
         data.densities = new Uint16Array(arrayBuffer.slice(offset, offset + densityByteLength));
         offset += densityByteLength;
 
-        const colorByteLength = data.tetCount * 3 * 2;
-        data.colors = new Uint16Array(arrayBuffer.slice(offset, offset + colorByteLength));
+        const colorByteLength = data.tetCount * 3;
+        data.colors = new Uint8Array(arrayBuffer.slice(offset, offset + colorByteLength));
         offset += colorByteLength;
 
         const gradientByteLength = data.tetCount * 3 * 2;
@@ -990,7 +990,7 @@ async function main() {
             setupTex(verticesTexture, 0, u_verticesTexture, u_verticesTextureSize, gl.RGB32F, gl.RGB, gl.FLOAT, e.data.vertices, 3);
             setupTex(indicesTexture, 1, u_indicesTexture, u_indicesTextureSize, gl.RGBA32UI, gl.RGBA_INTEGER, gl.UNSIGNED_INT, e.data.indices, 4);
             setupTex(densityTexture, 2, u_densityTexture, u_densityTextureSize, gl.R16F, gl.RED, gl.HALF_FLOAT, e.data.densities, 1);
-            setupTex(colorTexture, 3, u_colorTexture, u_colorTextureSize, gl.RGB16F, gl.RGB, gl.HALF_FLOAT, e.data.colors, 3);
+            setupTex(colorTexture, 3, u_colorTexture, u_colorTextureSize, gl.RGB8, gl.RGB, gl.UNSIGNED_BYTE, e.data.colors, 3);
             setupTex(gradientTexture, 4, u_gradientTexture, u_gradientTextureSize, gl.RGB16F, gl.RGB, gl.HALF_FLOAT, e.data.gradients, 3);
 
 
@@ -1077,16 +1077,27 @@ async function main() {
             if (!req.ok) {
                 throw new Error(`HTTP error! status: ${req.status}`);
             }
-            const arrayBuffer = await req.arrayBuffer();
+    
+            // const decompressionStream = new DecompressionStream('gzip');
+            // const decompressedStream = req.body.pipeThrough(decompressionStream);
+            // const arrayBuffer = await new Response(decompressedStream).arrayBuffer();
+
+            const compressedBuffer = await req.arrayBuffer();
+            arrayBuffer = pako.inflate(new Uint8Array(compressedBuffer)).buffer;
+    
             messageEl.innerText = 'Processing data...';
+            
+            // 4. Send the final, DECOMPRESSED ArrayBuffer to the worker
             worker.postMessage({ fileBuffer: arrayBuffer }, [arrayBuffer]);
             loaded = true;
+    
         } catch (error) {
             console.error('Failed to load default file:', error);
             messageEl.innerText = `Could not load default file. Please drop a file.`;
             spinnerEl.style.display = 'none';
         }
     }
+    
 
 
     const preventDefault = (e) => { e.preventDefault(); e.stopPropagation(); };
@@ -1113,13 +1124,14 @@ async function main() {
     let fileToLoad;
     // Check if a 'file' parameter was provided in the URL
     if (fileNameFromUrl) {
-        fileToLoad = `splats/${fileNameFromUrl}`;
+        fileToLoad = `rmeshes/${fileNameFromUrl}`;
         console.log(`Loading file from URL parameter: ${fileToLoad}`);
         loadFile(fileToLoad);
     } else {
         // Otherwise, fall back to the default file
-        // fileToLoad = "splats/room_small.splat";
-        // console.log(`Loading default file: ${fileToLoad}`);
+        fileToLoad = "rmeshes/garden_small.rmesh";
+        console.log(`Loading default file: ${fileToLoad}`);
+        loadFile(fileToLoad);
     }
 
 

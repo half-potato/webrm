@@ -1,14 +1,9 @@
-# You can use this to convert a .ply file to a .rmesh file programmatically in python
-# Alternatively you can drag and drop a .ply file into the viewer at https://antimatter15.com/rmesh
-
 import tinyplypy
-from plyfile import PlyData
 import numpy as np
 import argparse
 from io import BytesIO
-import matplotlib.pyplot as plt
-from pathlib import Path
 import gzip
+import math
 
 C0 = 0.28209479177387814
 C1 = 0.4886025119029199
@@ -219,7 +214,8 @@ def process_ply_to_rmesh(ply_file_path):
 
     # compress colors
     # colors = eval_sh(3, np.transpose(sh_dat, (0, 2, 1)), np.array([1, 0, 0]).reshape(1, 3))#dirs)
-    colors = eval_sh(3, np.transpose(sh_dat, (0, 2, 1)), dirs)
+    sh_deg = math.sqrt(sh_dat.shape[1]) - 1
+    colors = eval_sh(sh_deg, np.transpose(sh_dat, (0, 2, 1)), dirs)
     # sp_colors = 0.1*np.log(1+np.exp(10*colors)) + offset
     sp_colors = softplus(colors + offset)
     # plt.hist(sp_colors, bins=50)

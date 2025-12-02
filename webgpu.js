@@ -996,7 +996,21 @@ async function main() {
 
     const canvas = document.getElementById("canvas");
     const adapter = await navigator.gpu.requestAdapter({ powerPreference: "high-performance" });
-    const device = await adapter.requestDevice();
+    if (!adapter.features.has("subgroups")) {
+        throw new Error("Subgroups support is not available");
+    }
+
+    // 1. Inspect what the hardware is actually capable of
+    const deviceLimits = {
+        maxStorageBufferBindingSize: adapter.limits.maxStorageBufferBindingSize,
+        maxBufferSize: adapter.limits.maxBufferSize
+    };
+
+    // 2. Request the device with those specific limits
+    const device = await adapter.requestDevice({
+        requiredLimits: deviceLimits,
+        requiredFeatures: ["subgroups"],
+    });
     const context = canvas.getContext("webgpu");
 
     const presentationFormat = navigator.gpu.getPreferredCanvasFormat();
@@ -1078,7 +1092,7 @@ async function main() {
         if (e.data.vertices) {
 
             spinnerEl.style.display = 'none';
-            messageEl.innerText = 'Right-drag to look. Press M to enable WASDQE.';
+            messageEl.innerText = 'Left-drag to look. Press M to enable WASDQE.';
             tetCount = e.data.tetCount;
             const numVerts = e.data.vertices.length / 3;
 

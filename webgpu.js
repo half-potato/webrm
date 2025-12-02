@@ -6,7 +6,7 @@ struct Uniforms {
 };
 
 @group(0) @binding(0) var<uniform> uniforms: Uniforms;
-@group(0) @binding(1) var<storage, read> vertices: array<f32>; 
+@group(0) @binding(1) var<storage, read> vertices: array<f32>;
 @group(0) @binding(2) var<storage, read> indices: array<u32>;
 @group(0) @binding(3) var<storage, read> densities: array<f32>;
 @group(0) @binding(4) var<storage, read> colors: array<f32>;
@@ -20,8 +20,9 @@ struct VertexOutput {
     @location(2) planeNumerators: vec4<f32>,
     @location(3) planeDenominators: vec4<f32>,
     @location(4) rayDir: vec3<f32>,
-    @location(5) @interpolate(flat) tetAnchor: vec3<f32>,
-    @location(6) @interpolate(flat) grad: vec3<f32>,
+    @location(5) dc_dt: f32,
+    //@location(5) @interpolate(flat) tetAnchor: vec3<f32>,
+    //@location(6) @interpolate(flat) grad: vec3<f32>,
 };
 
 // Hardcoded indices for the 4 faces of a tetrahedron (12 verts total)
@@ -70,14 +71,17 @@ fn vs_main(@builtin(instance_index) instanceIdx: u32, @builtin(vertex_index) ver
 
     // 3. Determine which vertex of the 12 we are drawing
     // kTetFaceIndices maps 0..11 to 0..3 local index
-    let localIndex = kTetFaceIndices[vertIdx]; 
+    let localIndex = kTetFaceIndices[vertIdx];
     let worldPos = verts[localIndex];
 
     out.rayDir = normalize(worldPos - uniforms.rayOrigin);
     out.tetDensity = densities[tetId];
-    out.grad = getGradient(tetId);
-    out.tetAnchor = verts[0];
-    out.baseColor = getColor(tetId);
+    //out.grad = getGradient(tetId);
+    //out.tetAnchor = verts[0];
+    let grad = getGradient(tetId);
+    out.dc_dt = dot(grad, out.rayDir);
+    let offset2 = dot(grad, uniforms.rayOrigin - verts[0]);
+    out.baseColor = getColor(tetId) + offset2;
 
     // 4. Compute Planes (Ray-Tet Intersection Math)
     // We recreate the geometry locally to compute normals
@@ -86,7 +90,7 @@ fn vs_main(@builtin(instance_index) instanceIdx: u32, @builtin(vertex_index) ver
     let p1 = vec3<u32>(1u, 2u, 3u);
     let p2 = vec3<u32>(0u, 3u, 2u);
     let p3 = vec3<u32>(3u, 0u, 1u);
-    
+
     var planes = array<vec3<u32>, 4>(p0, p1, p2, p3);
 
     for (var i = 0u; i < 4u; i++) {
@@ -94,10 +98,10 @@ fn vs_main(@builtin(instance_index) instanceIdx: u32, @builtin(vertex_index) ver
         let vA = verts[idxs.x];
         let vB = verts[idxs.y];
         let vC = verts[idxs.z];
-        
+
         // Face normal
         let n = cross(vC - vA, vB - vA);
-        
+
         out.planeNumerators[i] = dot(n, vA - uniforms.rayOrigin);
         out.planeDenominators[i] = dot(n, out.rayDir);
     }
@@ -128,20 +132,21 @@ fn compute_integral(c0: vec3<f32>, c1: vec3<f32>, ddt: f32) -> vec4<f32> {
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let d = length(in.rayDir);
     let planeDenom = in.planeDenominators / d;
-    
+    let dc_dt = in.dc_dt / d;
+
     var opticalDepth = in.tetDensity;
     let all_t = in.planeNumerators / planeDenom;
 
     // WebGPU doesn't have vector greaterThan/lessThan logic exactly like GLSL
     // We use select for component-wise checks.
-    
+
     // t_enter: max of intersections where denom > 0
     var t_enter = vec4<f32>(-3.402823e38); // -FLT_MAX
     if (planeDenom.x > 0.0) { t_enter.x = all_t.x; }
     if (planeDenom.y > 0.0) { t_enter.y = all_t.y; }
     if (planeDenom.z > 0.0) { t_enter.z = all_t.z; }
     if (planeDenom.w > 0.0) { t_enter.w = all_t.w; }
-    
+
     // t_exit: min of intersections where denom < 0
     var t_exit = vec4<f32>(3.402823e38); // FLT_MAX
     if (planeDenom.x < 0.0) { t_exit.x = all_t.x; }
@@ -155,14 +160,8 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let dist = max(t_max - t_min, 0.0);
     opticalDepth *= dist;
 
-    let N = in.rayDir / d;
-    let pos_enter = uniforms.rayOrigin + N * t_min;
-    let local_diff = pos_enter - in.tetAnchor;
-    let local_offset = dot(in.grad, local_diff);
-    
-    let c_start = max(in.baseColor + local_offset, vec3<f32>(0.0));
-    let dc_dt = dot(in.grad, N);
-    let c_end = max(c_start + dc_dt * dist, vec3<f32>(0.0));
+    let c_start = max(in.baseColor + dc_dt * t_min, vec3<f32>(0.0));
+    let c_end = max(in.baseColor + dc_dt * t_max, vec3<f32>(0.0));
 
     return compute_integral(c_end, c_start, opticalDepth);
 }
@@ -740,8 +739,8 @@ function createWorker(self) {
         data.indices = new Uint32Array(arrayBuffer.slice(offset, offset + indexByteLength));
         offset += indexByteLength;
 
-        const densityByteLength = data.tetCount * 2;
-        data.densities = new Uint16Array(arrayBuffer.slice(offset, offset + densityByteLength));
+        const densityByteLength = data.tetCount * 1;
+        data.densities = new Uint8Array(arrayBuffer.slice(offset, offset + densityByteLength));
         offset += densityByteLength;
 
         const colorByteLength = data.tetCount * 3;
@@ -750,12 +749,13 @@ function createWorker(self) {
 
         const gradientByteLength = data.tetCount * 3 * 2;
         data.gradients = new Uint16Array(arrayBuffer.slice(offset, offset + gradientByteLength));
-        offset += gradientByteLength;
+        // offset += gradientByteLength; // No longer needed if this is the last read
 
-        const circumcenterByteLength = data.tetCount * 3 * 4;
-        data.circumcenters = new Float32Array(arrayBuffer.slice(offset, offset + circumcenterByteLength));
-
+        // --- REPLACED SECTION START ---
+        // Instead of reading circumcenters, we allocate array to fill later
+        data.circumcenters = new Float32Array(data.tetCount * 3);
         data.circumradiiSq = new Float32Array(data.tetCount);
+        // --- REPLACED SECTION END ---
 
         keys = new Float32Array(data.tetCount);
         payload = new Uint32Array(data.tetCount);
@@ -764,15 +764,70 @@ function createWorker(self) {
         tempKeys    = new Uint32Array(data.tetCount);
         tempPayload = new Uint32Array(data.tetCount);
 
+        // Loop over tetrahedra to calculate circumcenters and radii
         for (let i = 0; i < data.tetCount; i++) {
-            const v_idx = data.indices[i * 4];
-            const vx = data.vertices[v_idx * 3], vy = data.vertices[v_idx * 3 + 1], vz = data.vertices[v_idx * 3 + 2];
-            const cx = data.circumcenters[i * 3], cy = data.circumcenters[i * 3 + 1], cz = data.circumcenters[i * 3 + 2];
-            const dx = vx - cx, dy = vy - cy, dz = vz - cz;
-            data.circumradiiSq[i] = dx * dx + dy * dy + dz * dz;
+            // 1. Get Indices of the 4 vertices
+            const i0 = data.indices[i * 4];
+            const i1 = data.indices[i * 4 + 1];
+            const i2 = data.indices[i * 4 + 2];
+            const i3 = data.indices[i * 4 + 3];
+
+            // 2. Get Coordinates for v0, v1, v2, v3
+            const v0x = data.vertices[i0 * 3], v0y = data.vertices[i0 * 3 + 1], v0z = data.vertices[i0 * 3 + 2];
+            const v1x = data.vertices[i1 * 3], v1y = data.vertices[i1 * 3 + 1], v1z = data.vertices[i1 * 3 + 2];
+            const v2x = data.vertices[i2 * 3], v2y = data.vertices[i2 * 3 + 1], v2z = data.vertices[i2 * 3 + 2];
+            const v3x = data.vertices[i3 * 3], v3y = data.vertices[i3 * 3 + 1], v3z = data.vertices[i3 * 3 + 2];
+
+            // 3. Compute vectors relative to v0 (Python: a, b, c)
+            const ax = v1x - v0x, ay = v1y - v0y, az = v1z - v0z;
+            const bx = v2x - v0x, by = v2y - v0y, bz = v2z - v0z;
+            const cx = v3x - v0x, cy = v3y - v0y, cz = v3z - v0z;
+
+            // 4. Compute squares of lengths (Python: aa, bb, cc)
+            const aa = ax * ax + ay * ay + az * az;
+            const bb = bx * bx + by * by + bz * bz;
+            const cc = cx * cx + cy * cy + cz * cz;
+
+            // 5. Compute Cross Products
+            // cross_bc = b x c
+            const bcx = by * cz - bz * cy;
+            const bcy = bz * cx - bx * cz;
+            const bcz = bx * cy - by * cx;
+
+            // cross_ca = c x a
+            const cax = cy * az - cz * ay;
+            const cay = cz * ax - cx * az;
+            const caz = cx * ay - cy * ax;
+
+            // cross_ab = a x b
+            const abx = ay * bz - az * by;
+            const aby = az * bx - ax * bz;
+            const abz = ax * by - ay * bx;
+
+            // 6. Compute Denominator (2 * dot(a, cross_bc))
+            let denominator = 2.0 * (ax * bcx + ay * bcy + az * bcz);
+
+            // Handle small denominator (degenerate tetrahedra)
+            if (Math.abs(denominator) < 1e-12) {
+                denominator = 1.0; 
+            }
+
+            // 7. Compute Relative Circumcenter
+            // (aa * cross_bc + bb * cross_ca + cc * cross_ab) / denominator
+            const rx = (aa * bcx + bb * cax + cc * abx) / denominator;
+            const ry = (aa * bcy + bb * cay + cc * aby) / denominator;
+            const rz = (aa * bcz + bb * caz + cc * abz) / denominator;
+
+            // 8. Store Absolute Position (v0 + relative)
+            data.circumcenters[i * 3]     = v0x + rx;
+            data.circumcenters[i * 3 + 1] = v0y + ry;
+            data.circumcenters[i * 3 + 2] = v0z + rz;
+
+            // 9. Store Radius Squared (|relative|^2)
+            // Python used linalg.norm, here we need squared for the shader usually
+            data.circumradiiSq[i] = rx * rx + ry * ry + rz * rz;
         }
 
-        // NEW: allocate reusable scratch now that tetCount is known
         sizeList = new Int32Array(data.tetCount);
         counts0 = new Uint32Array(256 * 256);
         starts0 = new Uint32Array(256 * 256);
@@ -1050,12 +1105,13 @@ async function main() {
             // --- 2. Indices (Already Uint32, just copy) ---
             indexBuffer = createStorageBuffer(device, e.data.indices);
 
-            // --- 3. Densities (Uint16 Half-Float -> Float32) ---
+            // --- 3. Densities (Uint8 compressed density -> Float32) ---
             // The shader expects a standard float. We convert here.
-            const denRaw = e.data.densities; // Uint16Array
+            const denRaw = e.data.densities; // Uint8Array
             const denF32 = new Float32Array(denRaw.length);
             for (let i = 0; i < denRaw.length; i++) {
-                denF32[i] = decodeHalf(denRaw[i]); 
+                // denF32[i] = decodeHalf(denRaw[i]); 
+                denF32[i] = Math.exp((denRaw[i]-100)/20);
                 // Note: If your data is actually just normalized integers (0-65535 mapped to 0-1), 
                 // use: denRaw[i] / 65535.0; instead. 
                 // But based on your previous code using gl.HALF_FLOAT, decodeHalf is correct.

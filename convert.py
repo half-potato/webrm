@@ -202,11 +202,11 @@ def process_ply_to_rmesh(ply_file_path):
     dirs = -(cam1 - centroid)
     dirs = dirs / np.linalg.norm(dirs, axis=1, keepdims=True)
 
-    density_t = s.astype(np.float16)
+    # density_t = s.astype(np.float16)
 
-    # density_i = np.log(s)*20+100
-    # density_i[density_i<=1] = 0
-    # density_t = np.clip(density_i, 0, 255).astype(np.uint8)
+    density_i = np.log(s.clip(min=1e-3))*20+100
+    density_i[density_i<=1] = 0
+    density_t = np.clip(density_i, 0, 255).astype(np.uint8)
 
     grd_t = grd.astype(np.float16)
 
@@ -232,7 +232,7 @@ def process_ply_to_rmesh(ply_file_path):
     buffer.write(density_t.tobytes())
     buffer.write(rgb_t.tobytes())
     buffer.write(grd_t.tobytes())
-    buffer.write(circumcenters.tobytes())
+    # buffer.write(circumcenters.tobytes())
 
     compressed_bytes = gzip.compress(buffer.getvalue(), compresslevel=9)
     return compressed_bytes

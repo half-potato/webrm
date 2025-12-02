@@ -1301,17 +1301,17 @@ async function main() {
 
     // Start
     const urlParams = new URLSearchParams(window.location.search);
-    const fileNameFromUrl = urlParams.get('file') || "rmeshes/corsair.rmesh";
+    const fileNameFromUrl = urlParams.get('file') || "./rmeshes/corsair.rmesh";
 
     let fileToLoad;
     // Check if a 'file' parameter was provided in the URL
     if (fileNameFromUrl) {
-        fileToLoad = `rmeshes/${fileNameFromUrl}`;
+        fileToLoad = `./rmeshes/${fileNameFromUrl}`;
         console.log(`Loading file from URL parameter: ${fileToLoad}`);
         loadFile(fileToLoad);
     } else {
         // Otherwise, fall back to the default file
-        fileToLoad = "rmeshes/garden_small.rmesh";
+        fileToLoad = "./rmeshes/corsair.rmesh";
         console.log(`Loading default file: ${fileToLoad}`);
         loadFile(fileToLoad);
     }

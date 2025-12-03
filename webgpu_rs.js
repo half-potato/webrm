@@ -965,6 +965,70 @@ async function main() {
     const messageEl = document.getElementById("message");
     const spinnerEl = document.getElementById("spinner");
 
+    // --- Upscaling: dropdown UI (mobile-friendly) ------------------------------
+    const UPSCALE_CHOICES = [16, 4, 2, 1];
+
+    function getSavedUpscale() {
+      const saved = Number(localStorage.getItem('upscaleFactor'));
+      return UPSCALE_CHOICES.includes(saved) ? saved : 1; // default 2x
+    }
+    function saveUpscale(v) { localStorage.setItem('upscaleFactor', String(v)); }
+
+    // Create a small overlay with a <select>
+    function makeUpscaleDropdown(initial) {
+      const wrap = document.createElement('div');
+      wrap.style.position = 'fixed';
+      wrap.style.top = '12px';
+      wrap.style.right = '12px';
+      wrap.style.zIndex = '1000';
+      wrap.style.background = 'rgba(0,0,0,0.6)';
+      wrap.style.color = '#fff';
+      wrap.style.padding = '8px 10px';
+      wrap.style.borderRadius = '8px';
+      wrap.style.font = '12px system-ui, -apple-system, Segoe UI, Roboto, sans-serif';
+      wrap.style.display = 'flex';
+      wrap.style.gap = '8px';
+      wrap.style.alignItems = 'center';
+      wrap.style.backdropFilter = 'blur(6px)';
+
+      const label = document.createElement('label');
+      label.textContent = 'Upscale';
+      label.htmlFor = 'upscaleSelect';
+
+      const select = document.createElement('select');
+      select.id = 'upscaleSelect';
+      select.style.color = '#000';
+      select.style.borderRadius = '6px';
+      select.style.padding = '3px 6px';
+
+      [['16','16x (fastest)'], ['4','4x (fastest)'], ['2','2x'], ['1','1x (native)']].forEach(([v, txt]) => {
+        const opt = document.createElement('option');
+        opt.value = v; opt.textContent = txt;
+        select.appendChild(opt);
+      });
+      select.value = String(initial);
+
+      // Prevent canvas handlers from grabbing these events
+      ['pointerdown','mousedown','touchstart','wheel','click'].forEach(ev =>
+        wrap.addEventListener(ev, e => e.stopPropagation(), { passive: false })
+      );
+
+      select.addEventListener('change', () => {
+        upscaleFactor = Number(select.value);
+        saveUpscale(upscaleFactor);
+        resize(); // reallocate the backing buffer to new scale
+        messageEl.innerText = `Left-drag to orbit. Press M to enable WASDQE to move.`;
+      });
+
+      wrap.append(label, select);
+      document.body.appendChild(wrap);
+      return select;
+    }
+
+    // Init value + UI
+    let upscaleFactor = getSavedUpscale();
+    const upscaleSelectEl = makeUpscaleDropdown(upscaleFactor);
+
     const shaderModule = device.createShaderModule({ label: "Volume Shader", code: wgslSource });
     const computeShaderModule = device.createShaderModule({ label: "Compute Shader", code: computeSource });
 
@@ -1159,7 +1223,6 @@ async function main() {
 
     // --- Rendering ---
     const camera = new Camera([0, 3, -3], canvas);
-    let upscaleFactor = 2; 
     
     const resize = () => {
         const cssW = window.innerWidth;
@@ -1289,6 +1352,7 @@ async function main() {
     document.addEventListener('dragover', preventDefault);
     document.addEventListener('dragleave', preventDefault);
     document.addEventListener('drop', (e) => {
+        messageEl.innerText = 'Loading...';
         preventDefault(e);
         const file = e.dataTransfer.files[0];
         if (file) {
@@ -1296,16 +1360,39 @@ async function main() {
             reader.onload = (event) => {
                 spinnerEl.style.display = 'block';
                 messageEl.innerText = 'Processing data...';
-                worker.postMessage({ fileBuffer: event.target.result }, [event.target.result]);
+                
+                try {
+                    // 1. Get the compressed data
+                    const compressedBuffer = event.target.result;
+                    
+                    // 2. Inflate using Pako (same logic as loadFile)
+                    const decompressedData = pako.inflate(new Uint8Array(compressedBuffer));
+                    
+                    // 3. Extract the raw ArrayBuffer from the Uint8Array
+                    const arrayBuffer = decompressedData.buffer;
+
+                    // 4. Send the decompressed buffer to the worker
+                    worker.postMessage({ fileBuffer: arrayBuffer }, [arrayBuffer]);
+                } catch (error) {
+                    console.error('Decompression failed:', error);
+                    messageEl.innerText = 'Error: Invalid or corrupt file.';
+                    spinnerEl.style.display = 'none';
+                }
             };
             reader.readAsArrayBuffer(file);
         }
     });
 
     const urlParams = new URLSearchParams(window.location.search);
-    const fileToLoad = `./rmeshes/${urlParams.get('file')}` || "./rmeshes/corsair.rmesh";
-    console.log(`Loading file from URL parameter: ${fileToLoad}`);
-    loadFile(fileToLoad);
+    const fileNameFromUrl = urlParams.get('file');
+
+    // Check if a 'file' parameter was provided in the URL
+    if (fileNameFromUrl) {
+        const base_url = `https://pub-51212dd9bd624f0baa58d43d062bc53f.r2.dev/r1.0/`
+        const fileToLoad = base_url + `${urlParams.get('file')}` || "corsair.rmesh";
+        console.log(`Loading file from URL parameter: ${fileToLoad}`);
+        loadFile(fileToLoad);
+    }
     
     requestAnimationFrame(frame);
 }

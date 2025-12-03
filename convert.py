@@ -174,7 +174,7 @@ def tet_volumes(tets):
 def softplus(x, b=10):
     return 0.1*np.log(1+np.exp(10*x))
 
-def process_ply_to_rmesh(ply_file_path):
+def process_ply_to_rmesh(ply_file_path, out_deg):
     data = tinyplypy.read_ply(ply_file_path)
     vertices = np.stack([data['vertex']['x'], data['vertex']['y'], data['vertex']['z']], axis=1)
     indices = data['tetrahedron']['indices']
@@ -182,7 +182,10 @@ def process_ply_to_rmesh(ply_file_path):
     mask = np.isnan(s)
 
     grd = np.stack([data['tetrahedron']['grd_x'], data['tetrahedron']['grd_y'], data['tetrahedron']['grd_z']], axis=1)
-    sh_dat = load_sh(data['tetrahedron'])
+    sh_dat = load_sh(data['tetrahedron']) # Shape: (N, 16, 3)
+    sh_dat = sh_dat[:, :(out_deg+1)**2] + sh_dat[:, (out_deg+1)**2:].mean(dim=1, keepdims=True)
+    
+    # Filter masks
     s = s[~mask]
     grd = grd[~mask]
     sh_dat = sh_dat[~mask]
@@ -192,52 +195,51 @@ def process_ply_to_rmesh(ply_file_path):
     M = indices.shape[0]
 
     tets = vertices[indices]
-    cam1 = np.array([-4.0668, -0.5194,  0.9773]).reshape(1, 3)
-    # cam1 = np.array([ 4.1367, -0.5304,  1.0696]).reshape(1, 3)
-    cam1 = np.array([ 0.0, 3.0, -3.0]).reshape(1, 3)
-    circumcenters, radius = calculate_circumcenters(tets.astype(np.double))
-    circumcenters = circumcenters.astype(np.float32)
     centroid = tets.mean(axis=1)
-    # dirs = -(vertices.mean(axis=0, keepdims=True) - centroid)
-    dirs = -(cam1 - centroid)
-    dirs = dirs / np.linalg.norm(dirs, axis=1, keepdims=True)
 
-    # density_t = s.astype(np.float16)
-
+    # 1. Prepare Density (Log space -> uint8)
     density_i = np.log(s.clip(min=1e-3))*20+100
     density_i[density_i<=1] = 0
     density_t = np.clip(density_i, 0, 255).astype(np.uint8)
 
+    # 2. Prepare Gradients
     grd_t = grd.astype(np.float16)
 
-    offset = np.sum(grd * (tets[:, 0] - centroid), axis=1, keepdims=True)
+    # 3. Prepare SH Coefficients (The Logic Change)
+    # Clip to -1..1 range as requested
+    sh_dat = np.clip(sh_dat/2, -1.0, 1.0)
+    
+    # Quantize to uint8 (map -1..1 to 0..255)
+    # 0 = -1.0, 127 = ~0.0, 255 = 1.0
+    sh_uint8 = ((sh_dat * 127.5) + 127.5).astype(np.uint8)
 
-    # compress colors
-    # colors = eval_sh(3, np.transpose(sh_dat, (0, 2, 1)), np.array([1, 0, 0]).reshape(1, 3))#dirs)
-    sh_deg = math.sqrt(sh_dat.shape[1]) - 1
-    colors = eval_sh(sh_deg, np.transpose(sh_dat, (0, 2, 1)), dirs)
-    # sp_colors = 0.1*np.log(1+np.exp(10*colors)) + offset
-    sp_colors = softplus(colors + offset)
-    # plt.hist(sp_colors, bins=50)
-    # plt.show()
-    # rgb_t = ((sp_colors/4+0.5)*65535).clip(0, 65535).astype(np.uint16)
-    # rgb_t = sp_colors.astype(np.float16)
-    rgb_t = (sp_colors*255).clip(0, 255).astype(np.uint8)
+    # Transpose to Structure of Arrays (SoA)
+    # Current: (Tet, Coeff, Channel) -> Target: (Channel, Coeff, Tet)
+    # This groups all values for "Red Coeff 0" together, improving gzip compression
+    sh_soa = np.transpose(sh_uint8, (2, 1, 0)) 
+    
+    # Flatten: [R_C0_all... R_C15_all... G_C0_all...]
+    sh_flat = sh_soa.flatten()
 
     buffer = BytesIO()
-    buffer.write(np.array([N, M]).astype(np.uint32).tobytes())
+    buffer.write(np.array([N, M, out_deg]).astype(np.uint32).tobytes())
     buffer.write(vertices.tobytes())
-
     buffer.write(indices.tobytes())
     buffer.write(density_t.tobytes())
-    buffer.write(rgb_t.tobytes())
+    current_pos = buffer.tell()
+    pad_len = (4 - (current_pos % 4)) % 4
+    buffer.write(b'\x00' * pad_len)
+    
+    # Write the compressed SH buffer instead of baked RGB
+    buffer.write(sh_flat.tobytes()) 
+    current_pos = buffer.tell()
+    pad_len = (4 - (current_pos % 4)) % 4
+    buffer.write(b'\x00' * pad_len)
+    
     buffer.write(grd_t.tobytes())
-    # buffer.write(circumcenters.tobytes())
 
     compressed_bytes = gzip.compress(buffer.getvalue(), compresslevel=9)
     return compressed_bytes
-
-    # return buffer.getvalue()
 
 
 def save_rmesh_file(rmesh_data, output_path):
@@ -253,10 +255,13 @@ def main():
     parser.add_argument(
         "--output", "-o", default="output.rmesh", help="The output RMESH file."
     )
+    parser.add_argument(
+        "--degree", "-d", type=int, default=2, help="The degree of the final mesh"
+    )
     args = parser.parse_args()
     for input_file in args.input_files:
         print(f"Processing {input_file}...")
-        rmesh_data = process_ply_to_rmesh(input_file)
+        rmesh_data = process_ply_to_rmesh(input_file, args.degree)
         output_file = (
             args.output if len(args.input_files) == 1 else input_file + ".rmesh"
         )

@@ -1,41 +1,35 @@
 const computeSource = `
 struct Uniforms {
-    viewProjection: mat4x4<f32>, // offset 0
-    rayOrigin: vec3<f32>,        // offset 64 (align 16)
-    camPos: vec3<f32>,           // offset 80 (align 16)
-    tetCount: u32,               // offset 96 (align 16)
-    // Implicit padding makes this struct 112 bytes total
+    viewProjection: mat4x4<f32>,
+    rayOrigin: vec3<f32>,      // align 16
+    camPos: vec3<f32>,         // align 16
+    screenWidth: f32,
+    screenHeight: f32,
+    tetCount: u32,             // align 16
+    shDegree: u32,
 };
 
-// Variable for the COMPUTE shader (needs write access)
+struct DrawIndirectArgs {
+    vertexCount: atomic<u32>,
+    instanceCount: atomic<u32>, // We will atomicAdd this
+    firstVertex: u32,
+    firstInstance: u32,
+};
+
 @group(0) @binding(0) var<uniform> uniforms: Uniforms;
 @group(0) @binding(1) var<storage, read> vertices: array<f32>;
 @group(0) @binding(2) var<storage, read> indices: array<u32>;
 @group(0) @binding(3) var<storage, read_write> colors_compute: array<f32>;
 @group(0) @binding(4) var<storage, read> gradients: array<f32>;
 @group(0) @binding(5) var<storage, read> shCoeffs: array<u32>;
+// New Bindings for Sorting/Culling
+@group(0) @binding(6) var<storage, read> circumcenters: array<f32>;
+@group(0) @binding(7) var<storage, read> circumradii: array<f32>;
+@group(0) @binding(8) var<storage, read_write> sortKeys: array<u32>;   // Output for Radix Sort
+@group(0) @binding(9) var<storage, read_write> sortValues: array<u32>; // Output for Radix Sort
+@group(0) @binding(10) var<storage, read_write> indirectArgs: DrawIndirectArgs;
 
-// --- Helper: Read Uint8 from packed buffer ---
-fn getSHByte(channel: u32, coeff: u32, tetIdx: u32) -> f32 {
-    // Offset calculation for (Channel, Coeff, Tet) layout
-    // Total Size per channel = 16 * tetCount
-    let channelOffset = channel * 16u * uniforms.tetCount;
-    let coeffOffset = coeff * uniforms.tetCount;
-    let totalIndex = channelOffset + coeffOffset + tetIdx;
-    
-    // Find which u32 contains our byte
-    let wordIndex = totalIndex / 4u;
-    let byteIndex = totalIndex % 4u;
-    
-    let packedVal = shCoeffs[wordIndex];
-    let shift = byteIndex * 8u;
-    
-    // Extract byte and normalize 0..255 back to -1.0..1.0
-    let u8Val = (packedVal >> shift) & 0xFFu;
-    return ((f32(u8Val) / 127.5) - 1.0)*2;
-}
-
-// --- SH Evaluation Constants ---
+// --- SH Constants ---
 const C0 = 0.28209479177387814;
 const C1 = 0.4886025119029199;
 const C2_0 = 1.0925484305920792;
@@ -43,25 +37,32 @@ const C2_1 = -1.0925484305920792;
 const C2_2 = 0.31539156525252005;
 const C2_3 = -1.0925484305920792;
 const C2_4 = 0.5462742152960396;
-// ... (Add C3 and C4 constants similarly if using degree 3 or 4) ...
-// For brevity, I will implement up to Degree 2 (9 coeffs) below. 
-// You can extend to 16 coeffs using the logic from your Python script.
+
+fn getSHByte(channel: u32, coeff: u32, tetIdx: u32) -> f32 {
+    let numCoeffs = (uniforms.shDegree + 1u) * (uniforms.shDegree + 1u);
+    let channelOffset = channel * numCoeffs * uniforms.tetCount;
+    let coeffOffset = coeff * uniforms.tetCount;
+    let totalIndex = channelOffset + coeffOffset + tetIdx;
+    let wordIndex = totalIndex / 4u;
+    let byteIndex = totalIndex % 4u;
+    let packedVal = shCoeffs[wordIndex];
+    let shift = byteIndex * 8u;
+    let u8Val = (packedVal >> shift) & 0xFFu;
+    return ((f32(u8Val) / 127.5) - 1.0) * 2.0;
+}
+
+fn projectToNdc(pos: vec3<f32>, vp: mat4x4<f32>) -> vec4<f32> {
+    let clip = vp * vec4<f32>(pos, 1.0);
+    let invW = 1.0 / (clip.w + 0.000001);
+    return vec4<f32>(clip.xyz * invW, clip.w);
+}
 
 @compute @workgroup_size(64)
-fn compute_sh(
-    @builtin(global_invocation_id) global_id: vec3<u32>,
-    @builtin(num_workgroups) num_workgroups: vec3<u32>
-) {
-    // --- FIX: RECONSTRUCT LINEAR INDEX FROM 2D DISPATCH ---
-    // global_id.x handles the first 65535 * 64 items
-    // global_id.y handles the overflow rows
-    // stride is the width of the X-dimension in threads (workgroups.x * workgroup_size)
-    let stride = num_workgroups.x * 64u;
-    
-    let tetId = global_id.x + (global_id.y * stride);
+fn main(@builtin(global_invocation_id) global_id: vec3<u32>, @builtin(num_workgroups) num_workgroups: vec3<u32>) {
+    let tetId = global_id.x + (global_id.y * num_workgroups.x * 64u);
     if (tetId >= uniforms.tetCount) { return; }
 
-    // 1. Calculate Centroid
+    // --- 1. GEOMETRY PREP ---
     let i0 = indices[tetId * 4u + 0u] * 3u;
     let i1 = indices[tetId * 4u + 1u] * 3u;
     let i2 = indices[tetId * 4u + 2u] * 3u;
@@ -71,74 +72,125 @@ fn compute_sh(
     let v1 = vec3<f32>(vertices[i1], vertices[i1+1u], vertices[i1+2u]);
     let v2 = vec3<f32>(vertices[i2], vertices[i2+1u], vertices[i2+2u]);
     let v3 = vec3<f32>(vertices[i3], vertices[i3+1u], vertices[i3+2u]);
-    
-    let centroid = (v0 + v1 + v2 + v3) * 0.25;
 
-    // 2. View Direction
-    let dir = normalize(centroid - uniforms.camPos); 
-    // Note: Python used -(cam - centroid), which is (centroid - cam)
+    // --- 2. CULLING ---
+    // Project all 4 vertices to NDC
+    let p0 = projectToNdc(v0, uniforms.viewProjection);
+    let p1 = projectToNdc(v1, uniforms.viewProjection);
+    let p2 = projectToNdc(v2, uniforms.viewProjection);
+    let p3 = projectToNdc(v3, uniforms.viewProjection);
 
-    let x = dir.x; let y = dir.y; let z = dir.z;
+    // Calculate AABB in NDC
+    let minX = min(min(p0.x, p1.x), min(p2.x, p3.x));
+    let maxX = max(max(p0.x, p1.x), max(p2.x, p3.x));
+    let minY = min(min(p0.y, p1.y), min(p2.y, p3.y));
+    let maxY = max(max(p0.y, p1.y), max(p2.y, p3.y));
+    let minZ = min(min(p0.z, p1.z), min(p2.z, p3.z)); // WebGPU NDC Z is 0..1
 
-    // 3. Evaluate SH (loop over 3 channels: R=0, G=1, B=2)
-    var resultColor = vec3<f32>(0.0);
-
-    for (var c = 0u; c < 3u; c++) {
-        // Degree 0
-        let sh0 = getSHByte(c, 0u, tetId);
-        var val = C0 * sh0;
-
-        // Degree 1
-        let sh1 = getSHByte(c, 1u, tetId);
-        let sh2 = getSHByte(c, 2u, tetId);
-        let sh3 = getSHByte(c, 3u, tetId);
-        val -= C1 * y * sh1;
-        val += C1 * z * sh2;
-        val -= C1 * x * sh3;
-
-        // Degree 2
-        let xx = x*x; let yy = y*y; let zz = z*z;
-        let xy = x*y; let yz = y*z; let xz = x*z;
-        
-        let sh4 = getSHByte(c, 4u, tetId);
-        let sh5 = getSHByte(c, 5u, tetId);
-        let sh6 = getSHByte(c, 6u, tetId);
-        let sh7 = getSHByte(c, 7u, tetId);
-        let sh8 = getSHByte(c, 8u, tetId);
-
-        val += C2_0 * xy * sh4;
-        val += C2_1 * yz * sh5;
-        val += C2_2 * (2.0 * zz - xx - yy) * sh6;
-        val += C2_3 * xz * sh7;
-        val += C2_4 * (xx - yy) * sh8;
-
-        // ... Add Degree 3 logic here (coeffs 9-15) ...
-
-        resultColor[c] = val + 0.5; // +0.5 is from original SH2RGB
+    // Frustum Check
+    var isVisible = true;
+    if (maxX < -1.0 || minX > 1.0 || maxY < -1.0 || minY > 1.0 || minZ > 1.0) {
+        isVisible = false;
     }
 
-    // 4. Apply Offset (Gradient) 
-    // Note: The original logic applied softplus(color + offset). 
-    // Here we compute the gradient offset exactly as Python did:
-    let gx = gradients[tetId * 3u + 0u];
-    let gy = gradients[tetId * 3u + 1u];
-    let gz = gradients[tetId * 3u + 2u];
-    let grad = vec3<f32>(gx, gy, gz);
-    
-    // offset = dot(grd, v0 - centroid)
-    let offset = dot(grad, v0 - centroid);
+    // Screen Size Check
+    let screenScaleX = uniforms.screenWidth;
+    let screenScaleY = uniforms.screenHeight;
+    let extX = (maxX - minX) * screenScaleX;
+    let extY = (maxY - minY) * screenScaleY;
+    if ((extX * extY) < 1.0) {
+        isVisible = false;
+    }
 
-    // 5. Softplus Activation
-    // softplus(x) = 0.1 * log(1 + exp(10 * x))
-    let inputVal = resultColor + vec3<f32>(offset);
-    let sp = 0.1 * log(1.0 + exp(10.0 * inputVal));
+    // --- 3. KEY GENERATION ---
+    if (!isVisible) {
+        // Invisible: Set key to Max Uint so it sorts to the very end
+        sortKeys[tetId] = 0xFFFFFFFFu;
+        // We still write the ID, though it won't be drawn due to indirect count
+        sortValues[tetId] = tetId; 
+    } else {
+        // Visible: Calculate Depth
+        let cx = circumcenters[tetId * 3u];
+        let cy = circumcenters[tetId * 3u + 1u];
+        let cz = circumcenters[tetId * 3u + 2u];
+        let r2 = circumradii[tetId]; // Radius Squared
 
-    colors_compute[tetId * 3u + 0u] = sp.x;
-    colors_compute[tetId * 3u + 1u] = sp.y;
-    colors_compute[tetId * 3u + 2u] = sp.z;
+        let diff = vec3<f32>(cx, cy, cz) - uniforms.camPos;
+        // Depth = DistanceSq - RadiusSq (Distance to the closest point of sphere)
+        // We want Painter's Algo: Draw Far to Near.
+        // Radix Sort is Ascending (Small -> Large).
+        // We want Large Depth first. 
+        // Key = MaxUint - DepthBits.
+        
+        let distSq = dot(diff, diff);
+        let depth = distSq - r2;
+        
+        // Convert float depth to uint preserving order
+        // Since depth is likely positive (unless camera inside sphere), simple bitcast works.
+        // If depth can be negative, we need to flip sign bit logic (omitted for brevity, assuming external view)
+        let depthBits = bitcast<u32>(depth);
+        
+        // Invert bits to reverse sort order (Far -> Near)
+        sortKeys[tetId] = ~depthBits; 
+        sortValues[tetId] = tetId;
+
+        // Atomically increment the instance count for the Draw call
+        atomicAdd(&indirectArgs.instanceCount, 1u);
+
+        // --- 4. SH EVALUATION (Only if visible? Or always? Let's do always for simplicity) ---
+        // Optimally, you would put this in a separate pass running only on 'indirectArgs.instanceCount' items,
+        // but doing it here prevents pipeline complexity.
+
+        let centroid = (v0 + v1 + v2 + v3) * 0.25;
+        let dir = normalize(centroid - uniforms.camPos); 
+        let x = dir.x; let y = dir.y; let z = dir.z;
+
+        var resultColor = vec3<f32>(0.0);
+
+        for (var c = 0u; c < 3u; c++) {
+            // Degree 0
+            let sh0 = getSHByte(c, 0u, tetId);
+            var val = C0 * sh0;
+            // Degree 1
+            let sh1 = getSHByte(c, 1u, tetId);
+            let sh2 = getSHByte(c, 2u, tetId);
+            let sh3 = getSHByte(c, 3u, tetId);
+            val -= C1 * y * sh1;
+            val += C1 * z * sh2;
+            val -= C1 * x * sh3;
+            // Degree 2
+            let xx = x*x; let yy = y*y; let zz = z*z;
+            let xy = x*y; let yz = y*z; let xz = x*z;
+            let sh4 = getSHByte(c, 4u, tetId);
+            let sh5 = getSHByte(c, 5u, tetId);
+            let sh6 = getSHByte(c, 6u, tetId);
+            let sh7 = getSHByte(c, 7u, tetId);
+            let sh8 = getSHByte(c, 8u, tetId);
+            val += C2_0 * xy * sh4;
+            val += C2_1 * yz * sh5;
+            val += C2_2 * (2.0 * zz - xx - yy) * sh6;
+            val += C2_3 * xz * sh7;
+            val += C2_4 * (xx - yy) * sh8;
+
+            resultColor[c] = val + 0.5;
+        }
+
+        let gx = gradients[tetId * 3u + 0u];
+        let gy = gradients[tetId * 3u + 1u];
+        let gz = gradients[tetId * 3u + 2u];
+        let grad = vec3<f32>(gx, gy, gz);
+        let offset = dot(grad, v0 - centroid);
+        let inputVal = resultColor + vec3<f32>(offset);
+        let sp = 0.1 * log(1.0 + exp(10.0 * inputVal));
+
+        colors_compute[tetId * 3u + 0u] = sp.x;
+        colors_compute[tetId * 3u + 1u] = sp.y;
+        colors_compute[tetId * 3u + 2u] = sp.z;
+
+    }
 }
+`;
 
-`
 const wgslSource = `
 struct Uniforms {
     viewProjection: mat4x4<f32>, // offset 0
@@ -726,158 +778,15 @@ function createWorker(self) {
     let sizeList = null;                   // Int32Array(M), reused
     let counts0 = null, starts0 = null;    // Uint32Array(65536), reused
 
-    let camPos;
-    let lastPos = [];
-    let viewProjMatrix = new Float32Array(16);
-    let screenWidth = 1.0;
-    let screenHeight = 1.0;
-    let projVerts = new Float32Array(12);
-
     // Statically allocated buffers for sorting (unchanged)
     let keys, payload, tempKeys, tempPayload, intKeys;
 
-    // NEW: get an output array from pool or allocate once
-    function getDepthIndexArray(len) {
-        for (let i = 0; i < outBufferPool.length; i++) {
-            const buf = outBufferPool[i];
-            if (buf.byteLength === len * 4) { // Uint32Array length match
-                outBufferPool.splice(i, 1);
-                return new Uint32Array(buf);
-            }
-        }
-        return new Uint32Array(len);
-    }
-
-    var _floatView = new Float32Array(1);
-    var _int32View = new Int32Array(_floatView.buffer);
-    function floatToHalf(float) {
-        _floatView[0] = float;
-        var f = _int32View[0];
-
-        var sign = (f >> 31) & 0x0001;
-        var exp = (f >> 23) & 0x00ff;
-        var frac = f & 0x007fffff;
-
-        var newExp;
-        if (exp == 0) {
-            newExp = 0;
-        } else if (exp < 113) {
-            newExp = 0;
-            frac |= 0x00800000;
-            frac = frac >> (113 - exp);
-            if (frac & 0x01000000) {
-                newExp = 1;
-                frac = 0;
-            }
-        } else if (exp < 142) {
-            newExp = exp - 112;
-        } else {
-            newExp = 31;
-            frac = 0;
-        }
-
-        return (sign << 15) | (newExp << 10) | (frac >> 13);
-    }
-
-    const float32ToUint16 = (() => {
-      const buf = new ArrayBuffer(4);
-      const f32 = new Float32Array(buf);
-      const u32 = new Uint32Array(buf);
-
-      return (v) => {
-        f32[0] = v;
-        const x = u32[0];
-
-        const sign = (x >>> 16) & 0x8000;      // 1 bit
-        let   exp  = (x >>> 23) & 0xff;        // 8 bits
-        let   mant =  x & 0x7fffff;            // 23 bits
-
-        // Inf / NaN
-        if (exp === 0xff) {
-          return sign | (mant ? 0x7e00 : 0x7c00); // qNaN or Inf
-        }
-
-        // Zero / subnormal in f32: treat as zero in half (too small to matter)
-        if (exp === 0 && mant === 0) return sign;
-
-        // Re-bias exponent from f32 (127) to f16 (15)
-        let e16 = exp - 127 + 15;
-
-        // Overflow -> Inf
-        if (e16 >= 31) return sign | 0x7c00;
-
-        if (e16 <= 0) {
-          // Subnormal half: fold implicit 1, shift, and RNE
-          if (e16 < -10) return sign; // too small -> ±0
-          mant |= 0x00800000; // add hidden 1
-          // shift so that we’ll end with a 10-bit mantissa after rounding
-          const shift = 14 - e16;               // 1..10
-          // guard+round+sticky over 13 bits total to end at 10 bits
-          let m = mant >>> (shift + 13);
-          const rem = mant & ((1 << (shift + 13)) - 1);
-          const halfway = 1 << (shift + 12);
-          // round-to-nearest-even
-          if (rem > halfway || (rem === halfway && (m & 1))) m += 1;
-          return sign | m;
-        }
-
-        // Normal half: round 23->10 bits (keep guard/round/sticky)
-        // remainder below bit 13
-        const rem = mant & 0x1fff;
-        let m10 = mant >>> 13;
-        const halfway = 0x1000; // 1<<12
-        if (rem > halfway || (rem === halfway && (m10 & 1))) {
-          m10 += 1;
-          if (m10 === 0x400) {   // mantissa overflow -> bump exponent
-            m10 = 0;
-            e16 += 1;
-            if (e16 >= 31) return sign | 0x7c00; // became Inf
-          }
-        }
-        return sign | (e16 << 10) | m10;
-      };
-    })();
-    // --- NEW: sort mode ('half16' | 'f32x2') ------------------------------------
-    // let sortMode = 'half16';
-    let sortMode = 'f32x2';
-
-    // float -> sortable uint32 (ascending numeric order)
-    const f32ToSortableU32 = (() => {
-      const buf = new ArrayBuffer(4);
-      const f32 = new Float32Array(buf);
-      const u32 = new Uint32Array(buf);
-      return (v) => {
-        f32[0] = v;
-        let u = u32[0] >>> 0;
-        // if negative: invert all bits; else flip sign bit
-        u = (u & 0x80000000) ? (~u >>> 0) : (u ^ 0x80000000);
-        return u >>> 0;
-      };
-    })();
-
-    // one 16-bit LSD counting pass (stable)
-    function radix16Pass(inKeys, inPayload, outKeys, outPayload, shift) {
-      // buckets are 0..65535, reuse global counts0/starts0
-      counts0.fill(0);
-      for (let i = 0, M = inKeys.length; i < M; i++) {
-        counts0[(inKeys[i] >>> shift) & 0xFFFF]++;
-      }
-      starts0[0] = 0;
-      for (let b = 1; b < 65536; b++) starts0[b] = starts0[b - 1] + counts0[b - 1];
-
-      for (let i = 0, M = inKeys.length; i < M; i++) {
-        const b = (inKeys[i] >>> shift) & 0xFFFF;
-        const dst = starts0[b]++;
-        outKeys[dst] = inKeys[i];
-        outPayload[dst] = inPayload[i];
-      }
-    }
-
     function processTetrahedralData(arrayBuffer) {
-        const header = new Uint32Array(arrayBuffer, 0, 2);
+        const header = new Uint32Array(arrayBuffer, 0, 3);
         data.vertexCount = header[0];
         data.tetCount = header[1];
-        let offset = 8;
+        data.shDegree = header[2];
+        let offset = 4 * 3;
 
         const vertexByteLength = data.vertexCount * 3 * 4;
         data.vertices = new Float32Array(arrayBuffer.slice(offset, offset + vertexByteLength));
@@ -892,7 +801,9 @@ function createWorker(self) {
         offset += densityByteLength;
         offset += (4 - (offset % 4)) % 4;
 
-        const shByteLength = data.tetCount * 48; 
+        const coeffsPerChannel = (data.shDegree + 1) * (data.shDegree + 1);
+        const shByteLength = data.tetCount * coeffsPerChannel * 3; 
+        
         data.shCoeffs = new Uint8Array(arrayBuffer.slice(offset, offset + shByteLength));
         offset += shByteLength;
         offset += (4 - (offset % 4)) % 4;
@@ -909,8 +820,6 @@ function createWorker(self) {
         // --- REPLACED SECTION END ---
 
         keys = new Float32Array(data.tetCount);
-        payload = new Uint32Array(data.tetCount);
-        for (let i = 0; i < data.tetCount; i++) payload[i] = i;
         intKeys     = new Uint32Array(data.tetCount);
         tempKeys    = new Uint32Array(data.tetCount);
         tempPayload = new Uint32Array(data.tetCount);
@@ -984,234 +893,9 @@ function createWorker(self) {
         starts0 = new Uint32Array(256 * 256);
     }
 
-    /**
-     * Recalculates keys, culls primitives, and sorts the payload buffer.
-     */
-    function cullAndSortTets(camPos) {
-        function projectToNdc(x, y, z, m, outIdx, outArray) {
-            // m is Float32Array(16)
-            const w = x * m[3] + y * m[7] + z * m[11] + m[15];
-            
-            // If w is close to 0, vertex is at camera origin, handle gracefully
-            // (though usually we just let it blow up or clamp)
-            const invW = 1.0 / (w + 0.000001); 
-
-            // Compute XYZ and divide by W immediately (NDC)
-            outArray[outIdx]     = (x * m[0] + y * m[4] + z * m[8] + m[12]) * invW;
-            outArray[outIdx + 1] = (x * m[1] + y * m[5] + z * m[9] + m[13]) * invW;
-            outArray[outIdx + 2] = (x * m[2] + y * m[6] + z * m[10] + m[14]) * invW;
-            
-            return w; // Return w just in case we need it, though NDC is usually enough
-        }
-
-        if (!data.vertices) return;
-        x = camPos[0] - lastPos[0]
-        y = camPos[1] - lastPos[1]
-        z = camPos[2] - lastPos[2]
-        if ((x*x + y*y + z*z) < 0.01) return;
-        console.log(sortMode);
-        console.time("sort");
-
-        const INVISIBLE_DEPTH = 3.4e38; 
-
-        // Constants for screen size logic
-        // Reference: const float2 extent = outputResolution * (mx - mn).xy;
-        // NDC range is -1 to 1 (size 2). 
-        // We scale by 0.5 to convert NDC-normalized-size to 0..1, then mult by screen dim.
-        const screenScaleX = screenWidth * 0.5;
-        const screenScaleY = screenHeight * 0.5;
-
-        let visibleCount = 0;
-
-        const M = data.tetCount; // CHANGED: make constant & explicit
-        let maxDepth = -Infinity;
-        let minDepth = Infinity;
-
-        // (Re)use arrays
-        if (!sizeList || sizeList.length !== M) sizeList = new Int32Array(M);
-        console.log(viewProjMatrix);
-        counts0.fill(0);
-        starts0.fill(0);
-        if (sortMode === 'f32x2') {
-          // --- Float32 keys + two 16-bit passes (stable) ---------------------------
-          for (let i = 0; i < M; i++) {
-            const i0 = data.indices[i * 4];
-            const i1 = data.indices[i * 4 + 1];
-            const i2 = data.indices[i * 4 + 2];
-            const i3 = data.indices[i * 4 + 3];
-
-            // 2. Project all 4 vertices to NDC
-            // (Inline the lookups for speed)
-            let a = projectToNdc(data.vertices[i0*3], data.vertices[i0*3+1], data.vertices[i0*3+2], viewProjMatrix, 0, projVerts);
-            projectToNdc(data.vertices[i1*3], data.vertices[i1*3+1], data.vertices[i1*3+2], viewProjMatrix, 3, projVerts);
-            projectToNdc(data.vertices[i2*3], data.vertices[i2*3+1], data.vertices[i2*3+2], viewProjMatrix, 6, projVerts);
-            projectToNdc(data.vertices[i3*3], data.vertices[i3*3+1], data.vertices[i3*3+2], viewProjMatrix, 9, projVerts);
-
-            // 3. Calculate AABB in NDC space
-            // Unroll Min/Max for X (0,3,6,9), Y (1,4,7,10), Z (2,5,8,11)
-            
-            let minX = projVerts[0]; let maxX = minX;
-            let minY = projVerts[1]; let maxY = minY;
-            let minZ = projVerts[2]; let maxZ = minZ;
-
-            // Vertex 1
-            let v = projVerts[3]; if(v<minX) minX=v; if(v>maxX) maxX=v;
-            v = projVerts[4];     if(v<minY) minY=v; if(v>maxY) maxY=v;
-            v = projVerts[5];     if(v<minZ) minZ=v; if(v>maxZ) maxZ=v;
-
-            // Vertex 2
-            v = projVerts[6];     if(v<minX) minX=v; if(v>maxX) maxX=v;
-            v = projVerts[7];     if(v<minY) minY=v; if(v>maxY) maxY=v;
-            v = projVerts[8];     if(v<minZ) minZ=v; if(v>maxZ) maxZ=v;
-
-            // Vertex 3
-            v = projVerts[9];     if(v<minX) minX=v; if(v>maxX) maxX=v;
-            v = projVerts[10];    if(v<minY) minY=v; if(v>maxY) maxY=v;
-            v = projVerts[11];    if(v<minZ) minZ=v; if(v>maxZ) maxZ=v;
-
-            // console.log(minX, minY, minZ, maxX, maxY, maxZ);
-
-            // 4. Frustum Check (Reference Logic)
-            // bool in_frustum = !(mx.x < -1.0f || mn.x > 1.0f || mx.y < -1.0f || mn.y > 1.0f || mx.z < 0.f);
-            // Note: WebGPU NDC Z is 0..1. The reference code "mx.z < 0.f" checks if the object is fully behind the Near Plane.
-            
-            let isVisible = true;
-            if (maxX < -1.0 || minX > 1.0 || maxY < -1.0 || minY > 1.0 || maxZ < 0.0) {
-                isVisible = false;
-            }
-
-            // 5. Screen Size Check (Reference Logic)
-            // float2 extent = outputResolution * (mx - mn).xy;
-            // visible = ... && !(extent.x * extent.y < 1);
-            
-            if (isVisible) {
-                const extX = (maxX - minX) * screenScaleX;
-                const extY = (maxY - minY) * screenScaleY;
-                
-                // "If area is less than 1 pixel"
-                if ((extX * extY) < 1.0) {
-                    isVisible = false;
-                }
-            }
-            if(!isVisible) {
-                intKeys[i] = f32ToSortableU32(INVISIBLE_DEPTH);
-                continue;
-            }
-
-            const cx = data.circumcenters[i * 3], cy = data.circumcenters[i * 3 + 1], cz = data.circumcenters[i * 3 + 2];
-            const dx = cx - camPos[0], dy = cy - camPos[1], dz = cz - camPos[2];
-            const floatValue = -(dx * dx + dy * dy + dz * dz - data.circumradiiSq[i]);
-            intKeys[i] = f32ToSortableU32(floatValue);
-            visibleCount++;
-            // payload[] was initialized to i in processTetrahedralData()
-          }
-          for (let i = 0; i < M; i++) payload[i] = i;
-
-          // two LSD passes: low 16 -> temp, high 16 -> back
-          radix16Pass(intKeys, payload, tempKeys, tempPayload, 0);
-          radix16Pass(tempKeys, tempPayload, intKeys, payload, 16);
-
-          // Ship out a pooled copy of the sorted payload
-          const depthIndex = getDepthIndexArray(M);
-          depthIndex.set(payload);
-          console.timeEnd("sort");
-          console.log("visible_count", visibleCount);
-          lastPos = camPos;
-          self.postMessage({ depthIndex, visibleCount }, [depthIndex.buffer]);
-
-        } else {
-          // --- Existing half16 single-pass path (unchanged) -------------------------
-          let maxDepth = -Infinity, minDepth = Infinity;
-
-          for (let i = 0; i < M; i++) {
-            const cx = data.circumcenters[i * 3], cy = data.circumcenters[i * 3 + 1], cz = data.circumcenters[i * 3 + 2];
-            const dx = cx - camPos[0], dy = cy - camPos[1], dz = cz - camPos[2];
-            let floatValue = -(dx * dx + dy * dy + dz * dz - data.circumradiiSq[i]);
-
-            const u16 = float32ToUint16(floatValue);
-            let depth = (u16 & 0x8000) ? ((~u16) & 0xFFFF) : (u16 ^ 0x8000);
-            sizeList[i] = depth;
-            if (depth > maxDepth) maxDepth = depth;
-            if (depth < minDepth) minDepth = depth;
-          }
-
-          const range = maxDepth - minDepth || 1;
-          const depthInv = (65536 - 1) / range;
-          counts0.fill(0);
-          for (let i = 0; i < M; i++) {
-            sizeList[i] = ((sizeList[i] - minDepth) * depthInv) | 0;
-            counts0[sizeList[i]]++;
-          }
-          starts0[0] = 0;
-          for (let i = 1; i < 65536; i++) starts0[i] = starts0[i - 1] + counts0[i - 1];
-
-          const depthIndex = getDepthIndexArray(M);
-          for (let i = 0; i < M; i++) depthIndex[starts0[sizeList[i]]++] = i;
-
-          console.timeEnd("sort");
-          lastPos = camPos;
-          self.postMessage({ depthIndex, M }, [depthIndex.buffer]);
-        }
-        /*
-
-        for (let i = 0; i < M; i++) {
-            const cx = data.circumcenters[i * 3], cy = data.circumcenters[i * 3 + 1], cz = data.circumcenters[i * 3 + 2];
-            const dx = cx - camPos[0], dy = cy - camPos[1], dz = cz - camPos[2];
-
-            let floatValue = -(dx * dx + dy * dy + dz * dz - data.circumradiiSq[i]);
-            const uint16Value = float32ToUint16(floatValue);
-            // const uint16Value = floatToHalf(floatValue);
-
-            let depth;
-            if (uint16Value & 0x8000) {
-                depth = (~uint16Value) & 0xFFFF;
-            } else {
-                depth = uint16Value ^ 0x8000;
-            }
-            sizeList[i] = depth;
-            if (depth > maxDepth) maxDepth = depth;
-            if (depth < minDepth) minDepth = depth;
-        }
-
-        // 16-bit single-pass counting sort
-        const range = maxDepth - minDepth || 1;              // avoid div by zero
-        const depthInv = (256 * 256 - 1) / range;
-        for (let i = 0; i < M; i++) {
-            sizeList[i] = ((sizeList[i] - minDepth) * depthInv) | 0;
-            counts0[sizeList[i]]++;
-        }
-        for (let i = 1; i < 256 * 256; i++) starts0[i] = starts0[i - 1] + counts0[i - 1];
-
-        const depthIndex = getDepthIndexArray(M);            // NEW: pooled buffer
-        for (let i = 0; i < M; i++) depthIndex[starts0[sizeList[i]]++] = i;
-
-        console.timeEnd("sort");
-
-        lastPos = camPos;
-        self.postMessage({ depthIndex, M }, [depthIndex.buffer]); // transfer out
-        */
-    }
-
-    let sortRunning;
-
-    const throttledSort = () => {
-        if (!sortRunning) {
-            sortRunning = true;
-            const prev = camPos;
-            cullAndSortTets(prev);
-            setTimeout(() => {
-                sortRunning = false;
-                if (prev !== camPos) throttledSort();
-            }, 0);
-        }
-    };
-
     self.onmessage = (e) => {
         if (e.data.returnBuffer) {
-            // main thread returned ownership -> reuse next frame
-            outBufferPool.push(e.data.returnBuffer); // NEW
-        } else if (e.data.sortMode) {
-            sortMode = e.data.sortMode;
+            outBufferPool.push(e.data.returnBuffer);
         } else if (e.data.fileBuffer) {
             processTetrahedralData(e.data.fileBuffer);
             self.postMessage({
@@ -1221,13 +905,16 @@ function createWorker(self) {
                 gradients: data.gradients,
                 tetCount: data.tetCount,
                 shCoeffs: data.shCoeffs,
-            }, [data.densities.buffer, data.gradients.buffer, data.shCoeffs.buffer]);
-        } else if (e.data.camPos) {
-            camPos = e.data.camPos;
-            if (e.data.viewProj) viewProjMatrix.set(e.data.viewProj);
-            if (e.data.width) screenWidth = e.data.width;
-            if (e.data.height) screenHeight = e.data.height;
-            throttledSort();
+                circumcenters: data.circumcenters,
+                circumradiiSq: data.circumradiiSq,
+                shDegree: data.shDegree,
+            }, [
+                data.densities.buffer, 
+                data.gradients.buffer, 
+                data.shCoeffs.buffer,
+                data.circumcenters.buffer,
+                data.circumradiiSq.buffer
+            ]);
         }
     };
 }
@@ -1240,17 +927,27 @@ async function main() {
         return;
     }
 
+    if (typeof RadixSort === 'undefined') {
+        alert("RadixSort library not found. Ensure script tag is included.");
+        return;
+    }
+    const { RadixSortKernel } = RadixSort;
+
     const canvas = document.getElementById("canvas");
     const adapter = await navigator.gpu.requestAdapter({ powerPreference: "high-performance" });
+    
+    // Check if adapter exists
+    if (!adapter) {
+        alert("No appropriate GPUAdapter found.");
+        return;
+    }
 
-    // 1. Inspect what the hardware is actually capable of
     const deviceLimits = {
         maxStorageBufferBindingSize: adapter.limits.maxStorageBufferBindingSize,
         maxBufferSize: adapter.limits.maxBufferSize,
         maxStorageBuffersPerShaderStage: Math.max(10, adapter.limits.maxStorageBuffersPerShaderStage),
     };
 
-    // 2. Request the device with those specific limits
     const device = await adapter.requestDevice({
         requiredLimits: deviceLimits,
     });
@@ -1268,57 +965,62 @@ async function main() {
     const messageEl = document.getElementById("message");
     const spinnerEl = document.getElementById("spinner");
 
-    // --- Upscaling UI (Same as before) ---
-    const UPSCALE_CHOICES = [16, 4, 2, 1];
-    let upscaleFactor = 2; 
-    // ... [Insert your existing UI/Dropdown logic here if desired] ...
+    const shaderModule = device.createShaderModule({ label: "Volume Shader", code: wgslSource });
+    const computeShaderModule = device.createShaderModule({ label: "Compute Shader", code: computeSource });
 
-    // --- Shader Setup ---
-    // We will define the WGSL source later in the response
-    const shaderModule = device.createShaderModule({
-        label: "Volume Shader",
-        code: wgslSource // Defined at the bottom of this response
-    });
-    const computeShaderModule = device.createShaderModule({
-        label: "Compute Shader",
-        code: computeSource // Defined at the bottom of this response
-    });
+    function createStorageBuffer(typedArray) {
+        // Align size to 4 bytes
+        const size = (typedArray.byteLength + 3) & ~3; 
+        const buffer = device.createBuffer({
+            size: size,
+            usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+            mappedAtCreation: true
+        });
+        const mappedRange = buffer.getMappedRange();
+        
+        // Copy data
+        if (typedArray instanceof Uint32Array) new Uint32Array(mappedRange).set(typedArray);
+        else if (typedArray instanceof Uint16Array) new Uint16Array(mappedRange).set(typedArray);
+        else if (typedArray instanceof Uint8Array) new Uint8Array(mappedRange).set(typedArray);
+        else if (typedArray instanceof Float32Array) new Float32Array(mappedRange).set(typedArray);
+        
+        buffer.unmap();
+        return buffer;
+    }
 
-    // --- 1. RENDER LAYOUT (Vertex Shader) ---
-    // Binding 4 is "read-only-storage" here.
+    // --- Layouts ---
     const renderBindGroupLayout = device.createBindGroupLayout({
         label: "Render Layout",
         entries: [
             { binding: 0, visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT, buffer: { type: "uniform" } },
-            { binding: 1, visibility: GPUShaderStage.VERTEX, buffer: { type: "read-only-storage" } }, // Vertices
-            { binding: 2, visibility: GPUShaderStage.VERTEX, buffer: { type: "read-only-storage" } }, // Indices
-            { binding: 3, visibility: GPUShaderStage.VERTEX, buffer: { type: "read-only-storage" } }, // Densities
+            { binding: 1, visibility: GPUShaderStage.VERTEX, buffer: { type: "read-only-storage" } },
+            { binding: 2, visibility: GPUShaderStage.VERTEX, buffer: { type: "read-only-storage" } },
+            { binding: 3, visibility: GPUShaderStage.VERTEX, buffer: { type: "read-only-storage" } },
             { binding: 4, visibility: GPUShaderStage.VERTEX, buffer: { type: "read-only-storage" } },
-            { binding: 5, visibility: GPUShaderStage.VERTEX, buffer: { type: "read-only-storage" } }, // Gradients
-            { binding: 6, visibility: GPUShaderStage.VERTEX, buffer: { type: "read-only-storage" } }, // SortedIndices
+            { binding: 5, visibility: GPUShaderStage.VERTEX, buffer: { type: "read-only-storage" } },
+            { binding: 6, visibility: GPUShaderStage.VERTEX, buffer: { type: "read-only-storage" } },
         ]
     });
 
-    // --- 2. COMPUTE LAYOUT (Compute Shader) ---
-    // Binding 4 is "storage" (Read-Write) here. Includes SH buffers.
     const computeBindGroupLayout = device.createBindGroupLayout({
-        label: "Compute Layout",
         entries: [
             { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: "uniform" } },
             { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: "read-only-storage" } },
             { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: "read-only-storage" } },
-            { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: "storage" } },         // Colors (READ WRITE)
+            { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: "storage" } },
             { binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: { type: "read-only-storage" } },
-            { binding: 5, visibility: GPUShaderStage.COMPUTE, buffer: { type: "read-only-storage" } }, // Gradients
+            { binding: 5, visibility: GPUShaderStage.COMPUTE, buffer: { type: "read-only-storage" } },
+            { binding: 6, visibility: GPUShaderStage.COMPUTE, buffer: { type: "read-only-storage" } },
+            { binding: 7, visibility: GPUShaderStage.COMPUTE, buffer: { type: "read-only-storage" } },
+            { binding: 8, visibility: GPUShaderStage.COMPUTE, buffer: { type: "storage" } },
+            { binding: 9, visibility: GPUShaderStage.COMPUTE, buffer: { type: "storage" } },
+            { binding: 10, visibility: GPUShaderStage.COMPUTE, buffer: { type: "storage" } },
         ]
     });
 
     const pipeline = device.createRenderPipeline({
         layout: device.createPipelineLayout({ bindGroupLayouts: [renderBindGroupLayout] }),
-        vertex: {
-            module: shaderModule,
-            entryPoint: "vs_main",
-        },
+        vertex: { module: shaderModule, entryPoint: "vs_main" },
         fragment: {
             module: shaderModule,
             entryPoint: "fs_main",
@@ -1330,136 +1032,79 @@ async function main() {
                 }
             }]
         },
-        primitive: {
-            topology: "triangle-list",
-            cullMode: "back",
-        }
+        primitive: { topology: "triangle-list", cullMode: "back" }
     });
 
-    // --- Resources ---
+    const computePipeline = device.createComputePipeline({
+        layout: device.createPipelineLayout({ bindGroupLayouts: [computeBindGroupLayout] }),
+        compute: { module: computeShaderModule, entryPoint: "main" },
+    });
+
+    // --- Variables ---
     let vertexBuffer, indexBuffer, densityBuffer, colorBuffer, gradientBuffer, sortedIndexBuffer;
+    let circumCenterBuffer, circumRadiiBuffer, keysBuffer, valuesBuffer, indirectBuffer;
     let bindGroup, computeBindGroup;
-    const uniformBufferSize = 112; // Must be multiple of 16 for alignment
+    let radixSorter;
+    let tetCount = 0;
+    let shDegree = 0;
+    let visibleCount = 0;
+
+    const uniformBufferSize = 112; 
     const uniformBuffer = device.createBuffer({
         size: uniformBufferSize,
         usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST
     });
-
-    // Create a CPU-side buffer to hold the data
     const cpuUniformBuffer = new ArrayBuffer(uniformBufferSize);
-    // Create views into this buffer to write different types
     const uniformFloats = new Float32Array(cpuUniformBuffer);
     const uniformUints = new Uint32Array(cpuUniformBuffer);
 
-    // 2. Setup Compute Pipeline
-
-    const computePipeline = device.createComputePipeline({
-        layout: device.createPipelineLayout({ bindGroupLayouts: [computeBindGroupLayout] }),
-        compute: {
-            module: computeShaderModule, // <--- CHANGED
-            entryPoint: "compute_sh",
-        },
-    });
-
     // --- Worker Setup ---
-    let visibleCount = 0;
-    let tetCount = 0;
     const worker = new Worker(URL.createObjectURL(new Blob([`(${createWorker.toString()})(self)`], { type: "application/javascript" })));
 
-    // Handle incoming data from worker
     worker.onmessage = (e) => {
         if (e.data.vertices) {
-
             spinnerEl.style.display = 'none';
             messageEl.innerText = 'Left-drag to look. Press M to enable WASDQE.';
             tetCount = e.data.tetCount;
-            const numVerts = e.data.vertices.length / 3;
+            shDegree = e.data.shDegree;
+            
+            // <--- FIX: Using the scoped helper function without passing device
+            vertexBuffer = createStorageBuffer(e.data.vertices);
+            indexBuffer = createStorageBuffer(e.data.indices);
 
-            function createStorageBuffer(device, typedArray) {
-                // 1. Align size to 4 bytes (WebGPU requirement for mapped buffers)
-                //    Although your split logic handles this, it's good safety.
-                const size = (typedArray.byteLength + 3) & ~3; 
-
-                const buffer = device.createBuffer({
-                    size: size,
-                    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
-                    mappedAtCreation: true
-                });
-
-                const mappedRange = buffer.getMappedRange();
-
-                // 2. Create the correct view based on the input type
-                if (typedArray instanceof Uint32Array) {
-                    new Uint32Array(mappedRange).set(typedArray);
-                } else if (typedArray instanceof Uint16Array) {
-                    new Uint16Array(mappedRange).set(typedArray);
-                } else if (typedArray instanceof Uint8Array) {
-                    new Uint8Array(mappedRange).set(typedArray);
-                } else if (typedArray instanceof Float32Array) {
-                    new Float32Array(mappedRange).set(typedArray);
-                } else {
-                    throw new Error(`Unsupported TypedArray: ${typedArray.constructor.name}`);
-                }
-
-                buffer.unmap();
-                return buffer;
-            }
-
-            // --- 1. Vertices (Already Float32, just copy) ---
-            vertexBuffer = createStorageBuffer(device, e.data.vertices);
-
-            // --- 2. Indices (Already Uint32, just copy) ---
-            indexBuffer = createStorageBuffer(device, e.data.indices);
-
-            // --- 3. Densities (Uint8 compressed density -> Float32) ---
-            // The shader expects a standard float. We convert here.
-            const denRaw = e.data.densities; // Uint8Array
+            // Densities processing
+            const denRaw = e.data.densities;
             const denF32 = new Float32Array(denRaw.length);
             for (let i = 0; i < denRaw.length; i++) {
-                // denF32[i] = decodeHalf(denRaw[i]); 
                 denF32[i] = Math.exp((denRaw[i]-100)/20);
-                // Note: If your data is actually just normalized integers (0-65535 mapped to 0-1), 
-                // use: denRaw[i] / 65535.0; instead. 
-                // But based on your previous code using gl.HALF_FLOAT, decodeHalf is correct.
             }
-            densityBuffer = createStorageBuffer(device, denF32);
+            densityBuffer = createStorageBuffer(denF32);
 
-            // --- 4. Colors (Uint8 RGB -> Float32 Normalized) ---
-            // WebGL normalized this auto; WebGPU storage buffers don't.
-            // const colRaw = e.data.colors; // Uint8Array
-            // const colF32 = new Float32Array(colRaw.length);
-            // for (let i = 0; i < colRaw.length; i++) {
-            //     colF32[i] = colRaw[i] / 255.0; // Normalize to 0.0 - 1.0
-            // }
-            // colorBuffer = createStorageBuffer(device, colF32);
-
-            // SH Buffer
-            const shBuffer = createStorageBuffer(device, e.data.shCoeffs); // Helper handles padding if needed?
-            // Note: Uint8Array must be padded to 4-byte alignment for the buffer creation usually,
-            // but 48 bytes * tetCount is always 4-byte aligned.
-
-            // Colors Buffer (Allocate space for Float32 RGB)
+            // Colors setup
             const colorData = new Float32Array(e.data.tetCount * 3);
             colorBuffer = device.createBuffer({
                 size: colorData.byteLength,
-                usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC, // Needs STORAGE usage
+                usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC,
             });
 
-            // --- 5. Gradients (Uint16 Half-Float -> Float32) ---
-            const gradRaw = e.data.gradients; // Uint16Array
+            // Gradients processing
+            const gradRaw = e.data.gradients;
             const gradF32 = new Float32Array(gradRaw.length);
             for (let i = 0; i < gradRaw.length; i++) {
                 gradF32[i] = decodeHalf(gradRaw[i]);
             }
-            gradientBuffer = createStorageBuffer(device, gradF32);
+            gradientBuffer = createStorageBuffer(gradF32);
 
-            // --- 6. Sorted Index Buffer (Pre-allocate) ---
-            sortedIndexBuffer = device.createBuffer({
-                size: tetCount * 4, // 4 bytes per index (u32)
-                usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST
-            });
+            const shBuffer = createStorageBuffer(e.data.shCoeffs);
+            circumCenterBuffer = createStorageBuffer(e.data.circumcenters);
+            circumRadiiBuffer = createStorageBuffer(e.data.circumradiiSq);
 
-            // Create Compute BindGroup
+            // buffers for sort/indirect
+            sortedIndexBuffer = device.createBuffer({ size: tetCount * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+            keysBuffer = device.createBuffer({ size: tetCount * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC });
+            valuesBuffer = device.createBuffer({ size: tetCount * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC });
+            indirectBuffer = device.createBuffer({ size: 4 * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.INDIRECT | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC});
+
             computeBindGroup = device.createBindGroup({
                 layout: computeBindGroupLayout,
                 entries: [
@@ -1469,16 +1114,29 @@ async function main() {
                     { binding: 3, resource: { buffer: colorBuffer } }, 
                     { binding: 4, resource: { buffer: gradientBuffer } },
                     { binding: 5, resource: { buffer: shBuffer } },
+                    { binding: 6, resource: { buffer: circumCenterBuffer } },
+                    { binding: 7, resource: { buffer: circumRadiiBuffer } },
+                    { binding: 8, resource: { buffer: keysBuffer } },
+                    { binding: 9, resource: { buffer: valuesBuffer } },
+                    { binding: 10, resource: { buffer: indirectBuffer } },
                 ]
+            });
+
+            radixSorter = new RadixSortKernel({
+                device,
+                keys: keysBuffer,
+                values: valuesBuffer,
+                count: tetCount,
+                check_order: false,
+                bit_count: 32,                    // Number of bits per element. Must be a multiple of 4 (default: 32)
+                workgroup_size: { x: 16, y: 16 }, // Workgroup size in x and y dimensions. (x * y) must be a power of two
             });
 
             createBindGroup();
 
         } else if (e.data.depthIndex && sortedIndexBuffer) {
             visibleCount = e.data.visibleCount;
-            // Upload sorted indices
             device.queue.writeBuffer(sortedIndexBuffer, 0, e.data.depthIndex, 0, visibleCount);
-            // Return ownership to worker
             worker.postMessage({ returnBuffer: e.data.depthIndex.buffer }, [e.data.depthIndex.buffer]);
         }
     };
@@ -1494,15 +1152,15 @@ async function main() {
                 { binding: 3, resource: { buffer: densityBuffer } },
                 { binding: 4, resource: { buffer: colorBuffer } },
                 { binding: 5, resource: { buffer: gradientBuffer } },
-                { binding: 6, resource: { buffer: sortedIndexBuffer } },
+                { binding: 6, resource: { buffer: valuesBuffer } },
             ]
         });
     }
 
     // --- Rendering ---
     const camera = new Camera([0, 3, -3], canvas);
+    let upscaleFactor = 2; 
     
-    // Resize Observer
     const resize = () => {
         const cssW = window.innerWidth;
         const cssH = window.innerHeight;
@@ -1518,88 +1176,75 @@ async function main() {
     let frameCount = 0;
     let lastHudTime = 0;
     let lastFrameTime = performance.now();
+    const resetIndirectCmd = new Uint32Array([12, 0, 0, 0]);
 
     const frame = (now) => {
+        if (!indirectBuffer || !uniformBuffer || !bindGroup) {
+            requestAnimationFrame(frame);
+            return;
+        }
 
         const dt = (now - lastFrameTime) / 1000.0;
         lastFrameTime = now;
 
-        // --- IMPROVED FPS COUNTER ---
+        // FPS Logic
         frameCount++;
         const timeSinceHud = now - lastHudTime;
-
-        // Update HUD every 1000ms (1 second)
         if (timeSinceHud >= 1000) {
-            // Calculate average FPS over the specific time interval
             const fps = Math.round((frameCount * 1000) / timeSinceHud);
-            
             fpsEl.innerText = `${fps} fps`;
             tetsDrawnEl.innerText = `${tetCount.toLocaleString()} tets`;
-
-            // Reset counters
             frameCount = 0;
             lastHudTime = now;
         }
 
         camera.update(dt);
         const aspect = canvas.width / canvas.height;
-        console.log(canvas.width, canvas.height);
         const viewMat = camera.getViewMatrix();
         const projMat = camera.getProjectionMatrix(aspect);
-        const viewProj = multiply4(projMat, viewMat); // Uses your existing math function
-
-        // Notify worker of camera pos
-        worker.postMessage({
-            camPos: camera.position,
-            viewProj: viewProj,
-            width: canvas.width,
-            height: canvas.height,
-         });
+        const viewProj = multiply4(projMat, viewMat); 
 
         // Write Uniforms
-        // 1. Write Matrix (Indices 0-15)
         uniformFloats.set(viewProj, 0);
-
-        // 2. Write Ray Origin (Indices 16-18)
         uniformFloats[16] = camera.position[0];
         uniformFloats[17] = camera.position[1];
         uniformFloats[18] = camera.position[2];
-        // Index 19 is padding
-
-        // 3. Write Cam Pos (Indices 20-22)
         uniformFloats[20] = camera.position[0];
         uniformFloats[21] = camera.position[1];
         uniformFloats[22] = camera.position[2];
-        // Index 23 is padding
-
-        // 4. Write Tet Count (Index 24) using the UINT view
-        // Note: 24 * 4 bytes = 96 bytes offset, which matches our layout
-        uniformUints[23] = tetCount;
+        uniformFloats[23] = canvas.width;
+        uniformFloats[24] = canvas.height;
+        uniformUints[25] = tetCount;
+        uniformUints[26] = shDegree;
+        
         device.queue.writeBuffer(uniformBuffer, 0, cpuUniformBuffer);
+        device.queue.writeBuffer(indirectBuffer, 0, resetIndirectCmd);
 
         const commandEncoder = device.createCommandEncoder();
 
         // --- COMPUTE PASS ---
-        if (computeBindGroup && visibleCount > 0) {
+        if (computeBindGroup) {
             const pass = commandEncoder.beginComputePass();
             pass.setPipeline(computePipeline);
             pass.setBindGroup(0, computeBindGroup);
+            
+            // Dispatch 1 thread per tet
             const workgroupSize = 64;
             const totalWorkgroups = Math.ceil(tetCount / workgroupSize);
-            
-            // WebGPU limit per dimension is 65535
             const maxPerDim = 65535;
-            
             const dispatchX = Math.min(totalWorkgroups, maxPerDim);
             const dispatchY = Math.ceil(totalWorkgroups / maxPerDim);
-            
+            console.log("Running", dispatchX, dispatchY);
             pass.dispatchWorkgroups(dispatchX, dispatchY);
-            // Dispatch: ceil(tetCount / 64)
-            // pass.dispatchWorkgroups(Math.ceil(tetCount / 64));
             pass.end();
         }
 
-        // Draw
+        // --- SORT PASS ---
+        const sortPass = commandEncoder.beginComputePass({ label: "Radix Sort" });
+        radixSorter.dispatch(sortPass);
+        sortPass.end();
+
+        // --- RENDER PASS ---
         const passEncoder = commandEncoder.beginRenderPass({
             colorAttachments: [{
                 view: context.getCurrentTexture().createView(),
@@ -1609,11 +1254,11 @@ async function main() {
             }]
         });
 
-        if (bindGroup && visibleCount > 0) {
+        if (bindGroup) {
             passEncoder.setPipeline(pipeline);
             passEncoder.setBindGroup(0, bindGroup);
-            // Draw 12 vertices per tet (non-indexed draw, pulling verts in shader)
-            passEncoder.draw(12, visibleCount, 0, 0); 
+            // <--- FIX: Variable name mismatch. Was 'renderPass', changed to 'passEncoder'
+            passEncoder.drawIndirect(indirectBuffer, 0); 
         }
 
         passEncoder.end();
@@ -1627,32 +1272,18 @@ async function main() {
         messageEl.innerText = `Downloading ${url}...`;
         try {
             const req = await fetch(url);
-            if (!req.ok) {
-                throw new Error(`HTTP error! status: ${req.status}`);
-            }
-    
-            // const decompressionStream = new DecompressionStream('gzip');
-            // const decompressedStream = req.body.pipeThrough(decompressionStream);
-            // const arrayBuffer = await new Response(decompressedStream).arrayBuffer();
-
+            if (!req.ok) throw new Error(`HTTP error! status: ${req.status}`);
             const compressedBuffer = await req.arrayBuffer();
-            arrayBuffer = pako.inflate(new Uint8Array(compressedBuffer)).buffer;
-    
-            messageEl.innerText = 'Processing data...';
-            
-            // 4. Send the final, DECOMPRESSED ArrayBuffer to the worker
+            const arrayBuffer = pako.inflate(new Uint8Array(compressedBuffer)).buffer;
             worker.postMessage({ fileBuffer: arrayBuffer }, [arrayBuffer]);
-            loaded = true;
-    
         } catch (error) {
-            console.error('Failed to load default file:', error);
-            messageEl.innerText = `Could not load default file. Please drop a file.`;
+            console.error('Failed to load file:', error);
+            messageEl.innerText = `Could not load file.`;
             spinnerEl.style.display = 'none';
         }
     }
-    
 
-
+    // Drag and Drop
     const preventDefault = (e) => { e.preventDefault(); e.stopPropagation(); };
     document.addEventListener('dragenter', preventDefault);
     document.addEventListener('dragover', preventDefault);
@@ -1666,31 +1297,19 @@ async function main() {
                 spinnerEl.style.display = 'block';
                 messageEl.innerText = 'Processing data...';
                 worker.postMessage({ fileBuffer: event.target.result }, [event.target.result]);
-                loaded = true;
             };
             reader.readAsArrayBuffer(file);
         }
     });
 
-    // Start
     const urlParams = new URLSearchParams(window.location.search);
-    const fileNameFromUrl = urlParams.get('file') || "./rmeshes/corsair.rmesh";
-
-    let fileToLoad;
-    // Check if a 'file' parameter was provided in the URL
-    if (fileNameFromUrl) {
-        fileToLoad = `./rmeshes/${fileNameFromUrl}`;
-        console.log(`Loading file from URL parameter: ${fileToLoad}`);
-        loadFile(fileToLoad);
-    } else {
-        // Otherwise, fall back to the default file
-        fileToLoad = "./rmeshes/corsair.rmesh";
-        console.log(`Loading default file: ${fileToLoad}`);
-        loadFile(fileToLoad);
-    }
+    const fileToLoad = `./rmeshes/${urlParams.get('file')}` || "./rmeshes/corsair.rmesh";
+    console.log(`Loading file from URL parameter: ${fileToLoad}`);
+    loadFile(fileToLoad);
     
     requestAnimationFrame(frame);
 }
 
 // Helper to launch
 main().catch(console.error);
+

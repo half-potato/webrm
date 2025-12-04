@@ -431,35 +431,38 @@ function decodeHalf(float16bits) {
     return sign * Math.pow(2, exponent - 15) * (1 + (fraction / 1024));
 }
 
-
 class Camera {
     constructor(position = [0, 5, -2], canvas) {
         this.canvas = canvas;
 
         // General properties
-        this.fovY = 50; // Vertical field of view in degrees
+        this.fovY = 50; 
         this.nearZ = 0.01;
         this.farZ = 1000.0;
 
-        // Mode state
-        this.mode = 'orbit'; // 'free' or 'orbit'
+        // Mobile detection and default mode
+        const isMobile = /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(navigator.userAgent);
+        // this.mode = isMobile ? 'orbit' : 'free';
+        this.mode = 'orbit';
+        
         this.upAxis = new Float32Array([0, 0, -1]); // Z is up
 
-        // --- State for Free-Cam (Quaternion-based) ---
+        // State containers
         this.position = new Float32Array(position);
-        // Initial rotation quaternion is calculated to match the starting orbit view
         this.rotation = new Float32Array([0, 0, 0, 1]); 
+        this.orbitTarget = new Float32Array([0, 0, 0]);
+        this.orbitAngles = new Float32Array([0, 0]);
+        
+        this.orbitDistance = Math.hypot(...position);
         this.baseMoveSpeed = 0.5;
         this.rollSpeed = 1.5;
 
-        // --- State for Orbit-Cam (Euler-based) ---
-        this.orbitTarget = new Float32Array([0, 0, 0]);
-        this.orbitDistance = Math.hypot(...position);
-        // Initial angles are calculated to match the starting position
-        this.orbitAngles = new Float32Array([
-            Math.asin(position[2] / this.orbitDistance), // Pitch
-            Math.atan2(position[1], position[0])         // Yaw
-        ]);
+        // Initialize both modes based on start position
+        this._setInitialFreeCamRotation();
+        
+        // Use the initial position to set valid orbit angles/target (assuming looking at 0,0,0 initially)
+        this.orbitAngles[0] = Math.asin(position[2] / this.orbitDistance);
+        this.orbitAngles[1] = Math.atan2(position[1], position[0]);
 
         // Input state
         this.keys = new Set();
@@ -467,8 +470,31 @@ class Camera {
         this.lastMousePos = { x: 0, y: 0 };
         this.lastTouchState = { dist: 0 };
 
-        this._setInitialFreeCamRotation();
         this.addEventListeners();
+    }
+    setPose(position, rotation) {
+        this.position.set(position);
+        this.rotation.set(rotation);
+
+        // 1. Calculate Forward Vector from Quaternion (GL Forward is -Z)
+        const forward = this.vec3TransformQuat([0, 0, -1], this.rotation);
+
+        // 2. Project Target from Position
+        // We ensure orbitDistance is non-zero, defaults to 5.0 if undefined
+        const dist = this.orbitDistance > 0.1 ? this.orbitDistance : 5.0;
+        this.orbitDistance = dist;
+        
+        this.orbitTarget[0] = this.position[0] + forward[0] * dist;
+        this.orbitTarget[1] = this.position[1] + forward[1] * dist;
+        this.orbitTarget[2] = this.position[2] + forward[2] * dist;
+
+        // 3. Calculate Orbit Angles from the "Backward" vector (Vector from Target -> Eye)
+        const back = [-forward[0], -forward[1], -forward[2]];
+
+        // Pitch: arcsin of Z (assuming Z-up coordinate system from your orbit math)
+        this.orbitAngles[0] = Math.asin(back[2]);
+        // Yaw: atan2 of Y, X
+        this.orbitAngles[1] = Math.atan2(back[1], back[0]);
     }
 
     // --- Math Helpers ---
@@ -782,11 +808,16 @@ function createWorker(self) {
     let keys, payload, tempKeys, tempPayload, intKeys;
 
     function processTetrahedralData(arrayBuffer) {
-        const header = new Uint32Array(arrayBuffer, 0, 3);
+        const header = new Uint32Array(arrayBuffer, 0, 4);
         data.vertexCount = header[0];
         data.tetCount = header[1];
         data.shDegree = header[2];
-        let offset = 4 * 3;
+        let offset = 4 * 4;
+
+        let start_pos_byte_len = 4 * 8;
+        const start_pos = new Float32Array(arrayBuffer.slice(offset, offset + start_pos_byte_len));
+        data.start_pos = start_pos;
+        offset += start_pos_byte_len
 
         const vertexByteLength = data.vertexCount * 3 * 4;
         data.vertices = new Float32Array(arrayBuffer.slice(offset, offset + vertexByteLength));
@@ -908,6 +939,7 @@ function createWorker(self) {
                 circumcenters: data.circumcenters,
                 circumradiiSq: data.circumradiiSq,
                 shDegree: data.shDegree,
+                start_pos: data.start_pos,
             }, [
                 data.densities.buffer, 
                 data.gradients.buffer, 
@@ -1131,7 +1163,9 @@ async function main() {
             messageEl.innerText = 'Left-drag to look. Press M to enable WASDQE.';
             tetCount = e.data.tetCount;
             shDegree = e.data.shDegree;
-            
+
+            console.log(e.data.start_pos);
+            camera.setPose(e.data.start_pos.slice(0, 3), e.data.start_pos.slice(3, 7));
             // <--- FIX: Using the scoped helper function without passing device
             vertexBuffer = createStorageBuffer(e.data.vertices);
             indexBuffer = createStorageBuffer(e.data.indices);

@@ -4,6 +4,11 @@ import argparse
 from io import BytesIO
 import gzip
 import math
+from pathlib import Path
+import json
+import struct
+from pyquaternion import Quaternion
+
 
 C0 = 0.28209479177387814
 C1 = 0.4886025119029199
@@ -33,7 +38,7 @@ C4 = [
     0.47308734787878004,
     -1.7701307697799304,
     0.6258357354491761,
-]   
+]
 
 
 def RGB2SH(rgb):
@@ -113,11 +118,11 @@ def load_sh(tetra_dict):
 def calculate_circumcenters(vertices):
     """
     Compute the circumcenter of a tetrahedron.
-    
+
     Args:
         vertices: Tensor of shape (..., 4, 3) containing the vertices of the tetrahedron(a).
                  The first dimension can be batched.
-    
+
     Returns:
         circumcenter: Tensor of shape (..., 3) containing the circumcenter coordinates
     """
@@ -125,33 +130,33 @@ def calculate_circumcenters(vertices):
     a = vertices[..., 1, :] - vertices[..., 0, :]  # v1 - v0
     b = vertices[..., 2, :] - vertices[..., 0, :]  # v2 - v0
     c = vertices[..., 3, :] - vertices[..., 0, :]  # v3 - v0
-    
+
     # Compute squares of lengths
     aa = np.sum(a * a, axis=-1, keepdims=True)  # |a|^2
     bb = np.sum(b * b, axis=-1, keepdims=True)  # |b|^2
     cc = np.sum(c * c, axis=-1, keepdims=True)  # |c|^2
-    
+
     # Compute cross products
     cross_bc = np.cross(b, c, axis=-1)
     cross_ca = np.cross(c, a, axis=-1)
     cross_ab = np.cross(a, b, axis=-1)
-    
+
     # Compute denominator
     denominator = 2.0 * np.sum(a * cross_bc, axis=-1, keepdims=True)
-    
+
     # Create mask for small denominators
     mask = np.abs(denominator) < 1e-12
-    
+
     # Compute circumcenter relative to verts[0]
     relative_circumcenter = (
         aa * cross_bc +
         bb * cross_ca +
         cc * cross_ab
     ) / np.where(mask, np.ones_like(denominator), denominator)
-    
+
 
     radius = np.linalg.norm(a - relative_circumcenter, axis=-1)
-    
+
     # Return absolute position
     return vertices[..., 0, :] + relative_circumcenter, radius
 
@@ -164,17 +169,17 @@ def tet_volumes(tets):
     a = v1 - v0
     b = v2 - v0
     c = v3 - v0
-    
+
     mat = np.stack((a, b, c), axis=1)
     det = np.linalg.det(mat)
-    
+
     vol = det / 6.0
     return vol
 
 def softplus(x, b=10):
     return 0.1*np.log(1+np.exp(10*x))
 
-def process_ply_to_rmesh(ply_file_path, out_deg):
+def process_ply_to_rmesh(ply_file_path, starting_cam, out_deg):
     data = tinyplypy.read_ply(ply_file_path)
     vertices = np.stack([data['vertex']['x'], data['vertex']['y'], data['vertex']['z']], axis=1)
     indices = data['tetrahedron']['indices']
@@ -183,8 +188,8 @@ def process_ply_to_rmesh(ply_file_path, out_deg):
 
     grd = np.stack([data['tetrahedron']['grd_x'], data['tetrahedron']['grd_y'], data['tetrahedron']['grd_z']], axis=1)
     sh_dat = load_sh(data['tetrahedron']) # Shape: (N, 16, 3)
-    sh_dat = sh_dat[:, :(out_deg+1)**2] + sh_dat[:, (out_deg+1)**2:].mean(dim=1, keepdims=True)
-    
+    sh_dat = sh_dat[:, :(out_deg+1)**2] + np.mean(sh_dat[:, (out_deg+1)**2:], axis=1, keepdims=True)
+
     # Filter masks
     s = s[~mask]
     grd = grd[~mask]
@@ -208,7 +213,7 @@ def process_ply_to_rmesh(ply_file_path, out_deg):
     # 3. Prepare SH Coefficients (The Logic Change)
     # Clip to -1..1 range as requested
     sh_dat = np.clip(sh_dat/2, -1.0, 1.0)
-    
+
     # Quantize to uint8 (map -1..1 to 0..255)
     # 0 = -1.0, 127 = ~0.0, 255 = 1.0
     sh_uint8 = ((sh_dat * 127.5) + 127.5).astype(np.uint8)
@@ -216,37 +221,110 @@ def process_ply_to_rmesh(ply_file_path, out_deg):
     # Transpose to Structure of Arrays (SoA)
     # Current: (Tet, Coeff, Channel) -> Target: (Channel, Coeff, Tet)
     # This groups all values for "Red Coeff 0" together, improving gzip compression
-    sh_soa = np.transpose(sh_uint8, (2, 1, 0)) 
-    
+    sh_soa = np.transpose(sh_uint8, (2, 1, 0))
+
     # Flatten: [R_C0_all... R_C15_all... G_C0_all...]
     sh_flat = sh_soa.flatten()
 
     buffer = BytesIO()
-    buffer.write(np.array([N, M, out_deg]).astype(np.uint32).tobytes())
+    buffer.write(np.array([N, M, out_deg, 0]).astype(np.uint32).tobytes())
+    buffer.write(starting_cam.astype(np.float32).reshape(8).tobytes())
     buffer.write(vertices.tobytes())
     buffer.write(indices.tobytes())
     buffer.write(density_t.tobytes())
     current_pos = buffer.tell()
     pad_len = (4 - (current_pos % 4)) % 4
     buffer.write(b'\x00' * pad_len)
-    
+
     # Write the compressed SH buffer instead of baked RGB
-    buffer.write(sh_flat.tobytes()) 
+    buffer.write(sh_flat.tobytes())
     current_pos = buffer.tell()
     pad_len = (4 - (current_pos % 4)) % 4
     buffer.write(b'\x00' * pad_len)
-    
+
     buffer.write(grd_t.tobytes())
 
     compressed_bytes = gzip.compress(buffer.getvalue(), compresslevel=9)
     return compressed_bytes
 
 
-def save_rmesh_file(rmesh_data, output_path):
-    with open(output_path, "wb") as f:
-        f.write(rmesh_data)
 
+def read_next_bytes(fid, num_bytes, format_char_sequence, endian_character="<"):
+    """Read and unpack the next bytes from a binary file.
+    :param fid:
+    :param num_bytes: Sum of combination of {2, 4, 8}, e.g. 2, 6, 16, 30, etc.
+    :param format_char_sequence: List of {c, e, f, d, h, H, i, I, l, L, q, Q}.
+    :param endian_character: Any of {@, =, <, >, !}
+    :return: Tuple of read and unpacked values.
+    """
+    data = fid.read(num_bytes)
+    return struct.unpack(endian_character + format_char_sequence, data)
 
+def read_null_terminated_string(fid):
+    """
+    Reads characters from a file object until a null terminator is found.
+    """
+    char_list = []
+    while True:
+        char = fid.read(1)
+        if char == b'' or char == b'\x00': # Stop on null terminator or end of file
+            break
+        char_list.append(char)
+    return b''.join(char_list).decode("utf-8")
+
+def read_extrinsics_binary(path_to_model_file, transform_matrix):
+    """
+    Reads the images.bin file, converts to GL coordinates, applies transform,
+    and exports as [x, y, z, w] for JS compatibility.
+    """
+    images = []
+
+    # Orthogonalize the transform matrix to prevent skewing
+    u, _, vt = np.linalg.svd(transform_matrix[:3, :3])
+    transform_matrix[:3, :3] = u @ vt
+
+    with open(path_to_model_file, "rb") as fid:
+        num_reg_images = read_next_bytes(fid, 8, "Q")[0]
+        for _ in range(num_reg_images):
+            binary_image_properties = read_next_bytes(
+                fid, num_bytes=64, format_char_sequence="idddddddi")
+            image_id = binary_image_properties[0]
+
+            # COLMAP qvec is [w, x, y, z]
+            qvec = np.array(binary_image_properties[1:5])
+            tvec = np.array(binary_image_properties[5:8])
+            camera_id = binary_image_properties[8]
+
+            image_name = read_null_terminated_string(fid)
+
+            num_points2D = read_next_bytes(fid, num_bytes=8,
+                                           format_char_sequence="Q")[0]
+            fid.seek(24 * num_points2D, 1) # Skip 2D points
+
+            # 1. W2C (World-to-Camera) from COLMAP
+            w2c = np.eye(4)
+            w2c[:3, :3] = Quaternion(qvec).rotation_matrix
+            w2c[:3, 3] = tvec
+
+            # 2. C2W (Camera-to-World)
+            c2w = np.linalg.inv(w2c)
+
+            # 3. Coordinate System Conversion: COLMAP (Y-Down, Z-Fwd) -> GL (Y-Up, Z-Back)
+            # Flip local Y and Z axes by multiplying the rotation columns
+            c2w[:3, 1:3] *= -1
+
+            # 4. Apply scene transformation
+            new_c2w = transform_matrix @ c2w
+
+            new_tvec = new_c2w[:3, 3]
+            new_q = Quaternion(matrix=new_c2w[:3, :3])
+
+            # 5. Reorder to [x, y, z, w] for JS consumption
+            qvec_js = np.array([new_q.x, new_q.y, new_q.z, new_q.w])
+
+            images.append(np.concatenate([new_tvec, qvec_js, np.array([0.0])], axis=0))
+
+    return images
 def main():
     parser = argparse.ArgumentParser(description="Convert PLY files to SPLAT format.")
     parser.add_argument(
@@ -261,11 +339,17 @@ def main():
     args = parser.parse_args()
     for input_file in args.input_files:
         print(f"Processing {input_file}...")
-        rmesh_data = process_ply_to_rmesh(input_file, args.degree)
+        transform = np.loadtxt((Path(input_file).parent / "transform.txt"))
+        with (Path(input_file).parent / "config.json").open('r') as f:
+            js = json.load(f)
+            path = Path(js['dataset_path']) / "sparse/0/images.bin"
+            extrinsics = read_extrinsics_binary(str(path), transform)
+        rmesh_data = process_ply_to_rmesh(input_file, extrinsics[0], args.degree)
         output_file = (
             args.output if len(args.input_files) == 1 else input_file + ".rmesh"
         )
-        save_rmesh_file(rmesh_data, output_file)
+        with open(output_file, "wb") as f:
+            f.write(rmesh_data)
         print(f"Saved {output_file}")
 
 

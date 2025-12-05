@@ -1,7 +1,6 @@
 # webrm
 This is an cut down version of our [Vulkan based viewer](https://github.com/half-potato/vkrm) to allow wider support. Training code [here](https://github.com/half-potato/radiance_meshes)
-
-It `tet.js` can be used instead of `webgpu.js`, but it drastically reduces quality because I don't understand how GLSL precision works.
+Use `convert.py` to compress a `ply` file to a `rmesh` file. Uses [tinyplypy](https://github.com/half-potato/tinyplypy)
 
 # Limitations
 - No Mesh shading. Mesh shaders in webgpu do not support wave intrinsics yet, so there is very little benefit.

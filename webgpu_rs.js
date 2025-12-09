@@ -11,7 +11,7 @@ struct Uniforms {
 
 struct DrawIndirectArgs {
     vertexCount: atomic<u32>,
-    instanceCount: atomic<u32>, // We will atomicAdd this
+    instanceCount: atomic<u32>,
     firstVertex: u32,
     firstInstance: u32,
 };
@@ -21,34 +21,49 @@ struct DrawIndirectArgs {
 @group(0) @binding(2) var<storage, read> indices: array<u32>;
 @group(0) @binding(3) var<storage, read_write> colors_compute: array<f32>;
 @group(0) @binding(4) var<storage, read> gradients: array<f32>;
+// Read as u32, but interpreted as 2x f16
 @group(0) @binding(5) var<storage, read> shCoeffs: array<u32>;
-// New Bindings for Sorting/Culling
 @group(0) @binding(6) var<storage, read> circumcenters: array<f32>;
 @group(0) @binding(7) var<storage, read> circumradii: array<f32>;
-@group(0) @binding(8) var<storage, read_write> sortKeys: array<u32>;   // Output for Radix Sort
-@group(0) @binding(9) var<storage, read_write> sortValues: array<u32>; // Output for Radix Sort
+@group(0) @binding(8) var<storage, read_write> sortKeys: array<u32>;
+@group(0) @binding(9) var<storage, read_write> sortValues: array<u32>;
 @group(0) @binding(10) var<storage, read_write> indirectArgs: DrawIndirectArgs;
 
 // --- SH Constants ---
 const C0 = 0.28209479177387814;
 const C1 = 0.4886025119029199;
+
 const C2_0 = 1.0925484305920792;
 const C2_1 = -1.0925484305920792;
 const C2_2 = 0.31539156525252005;
 const C2_3 = -1.0925484305920792;
 const C2_4 = 0.5462742152960396;
 
-fn getSHByte(channel: u32, coeff: u32, tetIdx: u32) -> f32 {
+const C3_0 = -0.5900435899266435;
+const C3_1 = 2.890611442640554;
+const C3_2 = -0.4570457994644658;
+const C3_3 = 0.3731763325901154;
+const C3_4 = -0.4570457994644658;
+const C3_5 = 1.445305721320277;
+const C3_6 = -0.5900435899266435;
+
+fn getSHHalf(channel: u32, coeff: u32, tetIdx: u32) -> f32 {
     let numCoeffs = (uniforms.shDegree + 1u) * (uniforms.shDegree + 1u);
     let channelOffset = channel * numCoeffs * uniforms.tetCount;
     let coeffOffset = coeff * uniforms.tetCount;
+    
     let totalIndex = channelOffset + coeffOffset + tetIdx;
-    let wordIndex = totalIndex / 4u;
-    let byteIndex = totalIndex % 4u;
+    let wordIndex = totalIndex / 2u;
+    let subIndex = totalIndex % 2u;
+    
     let packedVal = shCoeffs[wordIndex];
-    let shift = byteIndex * 8u;
-    let u8Val = (packedVal >> shift) & 0xFFu;
-    return ((f32(u8Val) / 127.5) - 1.0) * 2.0;
+    let twoHalfs = unpack2x16float(packedVal);
+    
+    if (subIndex == 0u) {
+        return twoHalfs.x;
+    } else {
+        return twoHalfs.y;
+    }
 }
 
 fn projectToNdc(pos: vec3<f32>, vp: mat4x4<f32>) -> vec4<f32> {
@@ -74,26 +89,22 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>, @builtin(num_workgr
     let v3 = vec3<f32>(vertices[i3], vertices[i3+1u], vertices[i3+2u]);
 
     // --- 2. CULLING ---
-    // Project all 4 vertices to NDC
     let p0 = projectToNdc(v0, uniforms.viewProjection);
     let p1 = projectToNdc(v1, uniforms.viewProjection);
     let p2 = projectToNdc(v2, uniforms.viewProjection);
     let p3 = projectToNdc(v3, uniforms.viewProjection);
 
-    // Calculate AABB in NDC
     let minX = min(min(p0.x, p1.x), min(p2.x, p3.x));
     let maxX = max(max(p0.x, p1.x), max(p2.x, p3.x));
     let minY = min(min(p0.y, p1.y), min(p2.y, p3.y));
     let maxY = max(max(p0.y, p1.y), max(p2.y, p3.y));
-    let minZ = min(min(p0.z, p1.z), min(p2.z, p3.z)); // WebGPU NDC Z is 0..1
+    let minZ = min(min(p0.z, p1.z), min(p2.z, p3.z));
 
-    // Frustum Check
     var isVisible = true;
     if (maxX < -1.0 || minX > 1.0 || maxY < -1.0 || minY > 1.0 || minZ > 1.0) {
         isVisible = false;
     }
 
-    // Screen Size Check
     let screenScaleX = uniforms.screenWidth;
     let screenScaleY = uniforms.screenHeight;
     let extX = (maxX - minX) * screenScaleX;
@@ -104,73 +115,85 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>, @builtin(num_workgr
 
     // --- 3. KEY GENERATION ---
     if (!isVisible) {
-        // Invisible: Set key to Max Uint so it sorts to the very end
         sortKeys[tetId] = 0xFFFFFFFFu;
-        // We still write the ID, though it won't be drawn due to indirect count
         sortValues[tetId] = tetId; 
     } else {
-        // Visible: Calculate Depth
         let cx = circumcenters[tetId * 3u];
         let cy = circumcenters[tetId * 3u + 1u];
         let cz = circumcenters[tetId * 3u + 2u];
-        let r2 = circumradii[tetId]; // Radius Squared
+        let r2 = circumradii[tetId];
 
         let diff = vec3<f32>(cx, cy, cz) - uniforms.camPos;
-        // Depth = DistanceSq - RadiusSq (Distance to the closest point of sphere)
-        // We want Painter's Algo: Draw Far to Near.
-        // Radix Sort is Ascending (Small -> Large).
-        // We want Large Depth first. 
-        // Key = MaxUint - DepthBits.
-        
         let distSq = dot(diff, diff);
         let depth = distSq - r2;
         
-        // Convert float depth to uint preserving order
-        // Since depth is likely positive (unless camera inside sphere), simple bitcast works.
-        // If depth can be negative, we need to flip sign bit logic (omitted for brevity, assuming external view)
         let depthBits = bitcast<u32>(depth);
-        
-        // Invert bits to reverse sort order (Far -> Near)
         sortKeys[tetId] = ~depthBits; 
         sortValues[tetId] = tetId;
 
-        // Atomically increment the instance count for the Draw call
         atomicAdd(&indirectArgs.instanceCount, 1u);
-
-        // --- 4. SH EVALUATION (Only if visible? Or always? Let's do always for simplicity) ---
-        // Optimally, you would put this in a separate pass running only on 'indirectArgs.instanceCount' items,
-        // but doing it here prevents pipeline complexity.
 
         let centroid = (v0 + v1 + v2 + v3) * 0.25;
         let dir = normalize(centroid - uniforms.camPos); 
-        let x = dir.x; let y = dir.y; let z = dir.z;
+        
+        // Ray direction in OpenGL coords
+        let x = dir.x; 
+        let y = dir.y; 
+        let z = dir.z;
 
         var resultColor = vec3<f32>(0.0);
 
         for (var c = 0u; c < 3u; c++) {
             // Degree 0
-            let sh0 = getSHByte(c, 0u, tetId);
+            let sh0 = getSHHalf(c, 0u, tetId);
             var val = C0 * sh0;
-            // Degree 1
-            let sh1 = getSHByte(c, 1u, tetId);
-            let sh2 = getSHByte(c, 2u, tetId);
-            let sh3 = getSHByte(c, 3u, tetId);
-            val -= C1 * y * sh1;
-            val += C1 * z * sh2;
-            val -= C1 * x * sh3;
-            // Degree 2
-            let xx = x*x; let yy = y*y; let zz = z*z;
-            let xy = x*y; let yz = y*z; let xz = x*z;
-            let sh4 = getSHByte(c, 4u, tetId);
-            let sh5 = getSHByte(c, 5u, tetId);
-            let sh6 = getSHByte(c, 6u, tetId);
-            let sh7 = getSHByte(c, 7u, tetId);
-            let sh8 = getSHByte(c, 8u, tetId);
-            val += C2_0 * xy * sh4;
-            val += C2_1 * yz * sh5;
-            val += C2_2 * (2.0 * zz - xx - yy) * sh6;
-            val += C2_3 * xz * sh7;
-            val += C2_4 * (xx - yy) * sh8;
+
+            if (uniforms.shDegree >= 1u) {
+                // Degree 1
+                let sh1 = getSHHalf(c, 1u, tetId);
+                let sh2 = getSHHalf(c, 2u, tetId);
+                let sh3 = getSHHalf(c, 3u, tetId);
+                
+                // Flip odd powers of y/z
+                val -= C1 * y * sh1;
+                val += C1 * z * sh2;
+                val -= C1 * x * sh3;
+            }
+
+            if (uniforms.shDegree >= 2u) {
+                // Degree 2
+                let xx = x*x; let yy = y*y; let zz = z*z;
+                let xy = x*y; let yz = y*z; let xz = x*z;
+                
+                let sh4 = getSHHalf(c, 4u, tetId);
+                let sh5 = getSHHalf(c, 5u, tetId);
+                let sh6 = getSHHalf(c, 6u, tetId);
+                let sh7 = getSHHalf(c, 7u, tetId);
+                let sh8 = getSHHalf(c, 8u, tetId);
+                val += C2_0 * xy * sh4;
+                val += C2_1 * yz * sh5;
+                val += C2_2 * (2.0 * zz - xx - yy) * sh6;
+                val += C2_3 * xz * sh7;
+                val += C2_4 * (xx - yy) * sh8;
+
+                if (uniforms.shDegree >= 3u) {
+                     // Degree 3
+                    let sh9  = getSHHalf(c, 9u, tetId);
+                    let sh10 = getSHHalf(c, 10u, tetId);
+                    let sh11 = getSHHalf(c, 11u, tetId);
+                    let sh12 = getSHHalf(c, 12u, tetId);
+                    let sh13 = getSHHalf(c, 13u, tetId);
+                    let sh14 = getSHHalf(c, 14u, tetId);
+                    let sh15 = getSHHalf(c, 15u, tetId);
+                    val += -0.5900435899266435 * y * (3 * xx - yy) * sh9;
+                    val += 2.890611442640554 * xy * z * sh10;
+                    val += -0.4570457994644658 * y * (4 * zz - xx - yy)* sh11;
+                    val += 0.3731763325901154 * z * (2 * zz - 3 * xx - 3 * yy) * sh12;
+                    val += -0.4570457994644658 * x * (4 * zz - xx - yy) * sh13;
+                    val += 1.445305721320277 * z * (xx - yy) * sh14;
+                    val += -0.5900435899266435 * x * (xx - 3 * yy) * sh15;
+                }
+            }
 
             resultColor[c] = val + 0.5;
         }
@@ -186,7 +209,6 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>, @builtin(num_workgr
         colors_compute[tetId * 3u + 0u] = sp.x;
         colors_compute[tetId * 3u + 1u] = sp.y;
         colors_compute[tetId * 3u + 2u] = sp.z;
-
     }
 }
 `;
@@ -827,28 +849,23 @@ function createWorker(self) {
         data.indices = new Uint32Array(arrayBuffer.slice(offset, offset + indexByteLength));
         offset += indexByteLength;
 
-        const densityByteLength = data.tetCount * 1;
-        data.densities = new Uint8Array(arrayBuffer.slice(offset, offset + densityByteLength));
+        const densityByteLength = data.tetCount * 2;
+        data.densities = new Uint16Array(arrayBuffer.slice(offset, offset + densityByteLength));
         offset += densityByteLength;
         offset += (4 - (offset % 4)) % 4;
 
         const coeffsPerChannel = (data.shDegree + 1) * (data.shDegree + 1);
-        const shByteLength = data.tetCount * coeffsPerChannel * 3; 
+        const shByteLength = data.tetCount * coeffsPerChannel * 3 * 2; 
         
-        data.shCoeffs = new Uint8Array(arrayBuffer.slice(offset, offset + shByteLength));
+        data.shCoeffs = new Uint16Array(arrayBuffer.slice(offset, offset + shByteLength));
         offset += shByteLength;
         offset += (4 - (offset % 4)) % 4;
 
-
         const gradientByteLength = data.tetCount * 3 * 2;
         data.gradients = new Uint16Array(arrayBuffer.slice(offset, offset + gradientByteLength));
-        // offset += gradientByteLength; // No longer needed if this is the last read
 
-        // --- REPLACED SECTION START ---
-        // Instead of reading circumcenters, we allocate array to fill later
         data.circumcenters = new Float32Array(data.tetCount * 3);
         data.circumradiiSq = new Float32Array(data.tetCount);
-        // --- REPLACED SECTION END ---
 
         keys = new Float32Array(data.tetCount);
         intKeys     = new Uint32Array(data.tetCount);
@@ -1174,7 +1191,7 @@ async function main() {
             const denRaw = e.data.densities;
             const denF32 = new Float32Array(denRaw.length);
             for (let i = 0; i < denRaw.length; i++) {
-                denF32[i] = Math.exp((denRaw[i]-100)/20);
+                denF32[i] = decodeHalf(denRaw[i]);
             }
             densityBuffer = createStorageBuffer(denF32);
 

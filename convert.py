@@ -179,16 +179,53 @@ def tet_volumes(tets):
 def softplus(x, b=10):
     return 0.1*np.log(1+np.exp(10*x))
 
+def compress_matrix(data):
+    # 1. Reshape to (Samples, Features) -> (8000000, 48)
+    X = data.reshape(data.shape[0], -1)
+
+    # 2. Center the data (crucial for PCA/SVD interpretation)
+    mean_vec = np.mean(X, axis=0)
+    X_centered = X - mean_vec
+
+    # 3. Compute Covariance Matrix (48 x 48)
+    # We compute C = (X.T @ X) / (N-1). This is fast and low memory.
+    cov_matrix = np.dot(X_centered.T, X_centered) / (X_centered.shape[0] - 1)
+
+    # 4. Eigen Decomposition on the small (48x48) matrix
+    eigenvalues, eigenvectors = np.linalg.eigh(cov_matrix)
+
+    # 5. Sort eigenvectors by eigenvalues (descending)
+    sorted_indices = np.argsort(eigenvalues)[::-1]
+    eigenvectors = eigenvectors[:, sorted_indices]
+    eigenvalues = eigenvalues[sorted_indices]
+    print(eigenvalues)
+
+    # 6. Compress: Keep top 'k' components (e.g., k=12 for 4x compression)
+    k = 12
+    top_vectors = eigenvectors[:, :k]
+
+    # Project data onto principal components
+    # Result shape: (8000000, 12)
+    compressed_data = np.dot(X_centered, top_vectors)
+    # To Reconstruct:
+    reconstructed = np.dot(compressed_data, top_vectors.T) + mean_vec
+    reconstructed = reconstructed.reshape(-1, 16, 3)
+    print(np.abs(reconstructed - data).sum(axis=1).sum(axis=1).mean())
+    return compressed_data, top_vectors.T, mean_vec
+
+
+
 def process_ply_to_rmesh(ply_file_path, starting_cam, out_deg):
     data = tinyplypy.read_ply(ply_file_path)
     vertices = np.stack([data['vertex']['x'], data['vertex']['y'], data['vertex']['z']], axis=1)
     indices = data['tetrahedron']['indices']
     s = data['tetrahedron']['s']
-    mask = np.isnan(s)
+    mask = np.isnan(s) | (s < 1e-3)
 
     grd = np.stack([data['tetrahedron']['grd_x'], data['tetrahedron']['grd_y'], data['tetrahedron']['grd_z']], axis=1)
     sh_dat = load_sh(data['tetrahedron']) # Shape: (N, 16, 3)
-    sh_dat = sh_dat[:, :(out_deg+1)**2] + np.mean(sh_dat[:, (out_deg+1)**2:], axis=1, keepdims=True)
+    sh_dat = sh_dat[:, :(out_deg+1)**2]
+    sh_comp = compress_matrix(sh_dat)
 
     # Filter masks
     s = s[~mask]
@@ -200,28 +237,22 @@ def process_ply_to_rmesh(ply_file_path, starting_cam, out_deg):
     M = indices.shape[0]
 
     tets = vertices[indices]
-    centroid = tets.mean(axis=1)
-
+    
     # 1. Prepare Density (Log space -> uint8)
-    density_i = np.log(s.clip(min=1e-3))*20+100
-    density_i[density_i<=1] = 0
-    density_t = np.clip(density_i, 0, 255).astype(np.uint8)
+    # density_i = np.log(s.clip(min=1e-3))*20+100
+    # density_i[density_i<=1] = 0
+    # density_t = np.clip(density_i, 0, 255).astype(np.uint8)
+    density_t = s.astype(np.float16)
 
     # 2. Prepare Gradients
     grd_t = grd.astype(np.float16)
 
-    # 3. Prepare SH Coefficients (The Logic Change)
-    # Clip to -1..1 range as requested
-    sh_dat = np.clip(sh_dat/2, -1.0, 1.0)
-
-    # Quantize to uint8 (map -1..1 to 0..255)
-    # 0 = -1.0, 127 = ~0.0, 255 = 1.0
-    sh_uint8 = ((sh_dat * 127.5) + 127.5).astype(np.uint8)
-
-    # Transpose to Structure of Arrays (SoA)
-    # Current: (Tet, Coeff, Channel) -> Target: (Channel, Coeff, Tet)
-    # This groups all values for "Red Coeff 0" together, improving gzip compression
-    sh_soa = np.transpose(sh_uint8, (2, 1, 0))
+    # 3. Prepare SH as Half Float (float16)
+    # Cast directly to float16, no normalization to 0-255 required
+    sh_half = sh_dat.astype(np.float16)
+    
+    # Transpose to Structure of Arrays: [Channel, Coeff, Tet]
+    sh_soa = np.transpose(sh_half, (2, 1, 0))
 
     # Flatten: [R_C0_all... R_C15_all... G_C0_all...]
     sh_flat = sh_soa.flatten()
@@ -236,7 +267,7 @@ def process_ply_to_rmesh(ply_file_path, starting_cam, out_deg):
     pad_len = (4 - (current_pos % 4)) % 4
     buffer.write(b'\x00' * pad_len)
 
-    # Write the compressed SH buffer instead of baked RGB
+    # Write the float16 buffer
     buffer.write(sh_flat.tobytes())
     current_pos = buffer.tell()
     pad_len = (4 - (current_pos % 4)) % 4
@@ -246,7 +277,6 @@ def process_ply_to_rmesh(ply_file_path, starting_cam, out_deg):
 
     compressed_bytes = gzip.compress(buffer.getvalue(), compresslevel=9)
     return compressed_bytes
-
 
 
 def read_next_bytes(fid, num_bytes, format_char_sequence, endian_character="<"):
@@ -325,6 +355,7 @@ def read_extrinsics_binary(path_to_model_file, transform_matrix):
             images.append(np.concatenate([new_tvec, qvec_js, np.array([0.0])], axis=0))
 
     return images
+
 def main():
     parser = argparse.ArgumentParser(description="Convert PLY files to SPLAT format.")
     parser.add_argument(

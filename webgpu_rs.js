@@ -7,6 +7,7 @@ struct Uniforms {
     screenHeight: f32,
     tetCount: u32,             // align 16
     shDegree: u32,
+    kComponents: u32,           // Added K
 };
 
 struct DrawIndirectArgs {
@@ -21,8 +22,16 @@ struct DrawIndirectArgs {
 @group(0) @binding(2) var<storage, read> indices: array<u32>;
 @group(0) @binding(3) var<storage, read_write> colors_compute: array<f32>;
 @group(0) @binding(4) var<storage, read> gradients: array<f32>;
-// Read as u32, but interpreted as 2x f16
-@group(0) @binding(5) var<storage, read> shCoeffs: array<u32>;
+// --- COMPRESSION BUFFERS ---
+// Weights: N tets * k components. Packed as f16 (u32 = 2xf16)
+@group(0) @binding(5) var<storage, read> shWeights: array<u32>; 
+
+// Mean: (Deg+1)^2 * 3 floats.
+@group(0) @binding(11) var<storage, read> shMean: array<f32>; 
+
+// Basis: k * (Deg+1)^2 * 3 floats.
+@group(0) @binding(12) var<storage, read> shBasis: array<f32>;
+
 @group(0) @binding(6) var<storage, read> circumcenters: array<f32>;
 @group(0) @binding(7) var<storage, read> circumradii: array<f32>;
 @group(0) @binding(8) var<storage, read_write> sortKeys: array<u32>;
@@ -47,23 +56,39 @@ const C3_4 = -0.4570457994644658;
 const C3_5 = 1.445305721320277;
 const C3_6 = -0.5900435899266435;
 
-fn getSHHalf(channel: u32, coeff: u32, tetIdx: u32) -> f32 {
-    let numCoeffs = (uniforms.shDegree + 1u) * (uniforms.shDegree + 1u);
-    let channelOffset = channel * numCoeffs * uniforms.tetCount;
-    let coeffOffset = coeff * uniforms.tetCount;
-    
-    let totalIndex = channelOffset + coeffOffset + tetIdx;
-    let wordIndex = totalIndex / 2u;
-    let subIndex = totalIndex % 2u;
-    
-    let packedVal = shCoeffs[wordIndex];
+fn getWeight(tetId: u32, k: u32) -> f32 {
+    let index = tetId * uniforms.kComponents + k;
+    let wordIndex = index / 2u;
+    let subIndex = index % 2u;
+    let packedVal = shWeights[wordIndex];
     let twoHalfs = unpack2x16float(packedVal);
+    return select(twoHalfs.x, twoHalfs.y, subIndex == 1u);
+}
+
+// Reconstruct a specific SH coefficient for a specific channel
+fn reconstructSH(channel: u32, coeff: u32, tetId: u32) -> f32 {
+    let numCoeffs = (uniforms.shDegree + 1u) * (uniforms.shDegree + 1u);
+    let featIndex = channel * numCoeffs + coeff;
     
-    if (subIndex == 0u) {
-        return twoHalfs.x;
-    } else {
-        return twoHalfs.y;
+    var val = shMean[featIndex];
+    
+    // Dot product: Weights(tet) . Basis(:, featIndex)
+    // Unrolled slightly for vec4 performance if possible, but loop is fine
+    for (var k = 0u; k < uniforms.kComponents; k++) {
+        let w = getWeight(tetId, k);
+        // Basis is flattened: [k0_all_feats, k1_all_feats...]
+        // Actually python saved as (k, 48). 
+        // Index = k * total_features + featIndex
+        let total_features = numCoeffs * 3u;
+        let b = shBasis[k * total_features + featIndex];
+        val += w * b;
     }
+    return val;
+}
+
+// Helper to replace getSH
+fn getSH(c: u32, idx: u32, tetId: u32) -> f32 {
+    return reconstructSH(c, idx, tetId);
 }
 
 fn projectToNdc(pos: vec3<f32>, vp: mat4x4<f32>) -> vec4<f32> {
@@ -145,14 +170,14 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>, @builtin(num_workgr
 
         for (var c = 0u; c < 3u; c++) {
             // Degree 0
-            let sh0 = getSHHalf(c, 0u, tetId);
+            let sh0 = getSH(c, 0u, tetId);
             var val = C0 * sh0;
 
             if (uniforms.shDegree >= 1u) {
                 // Degree 1
-                let sh1 = getSHHalf(c, 1u, tetId);
-                let sh2 = getSHHalf(c, 2u, tetId);
-                let sh3 = getSHHalf(c, 3u, tetId);
+                let sh1 = getSH(c, 1u, tetId);
+                let sh2 = getSH(c, 2u, tetId);
+                let sh3 = getSH(c, 3u, tetId);
                 
                 // Flip odd powers of y/z
                 val -= C1 * y * sh1;
@@ -165,11 +190,11 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>, @builtin(num_workgr
                 let xx = x*x; let yy = y*y; let zz = z*z;
                 let xy = x*y; let yz = y*z; let xz = x*z;
                 
-                let sh4 = getSHHalf(c, 4u, tetId);
-                let sh5 = getSHHalf(c, 5u, tetId);
-                let sh6 = getSHHalf(c, 6u, tetId);
-                let sh7 = getSHHalf(c, 7u, tetId);
-                let sh8 = getSHHalf(c, 8u, tetId);
+                let sh4 = getSH(c, 4u, tetId);
+                let sh5 = getSH(c, 5u, tetId);
+                let sh6 = getSH(c, 6u, tetId);
+                let sh7 = getSH(c, 7u, tetId);
+                let sh8 = getSH(c, 8u, tetId);
                 val += C2_0 * xy * sh4;
                 val += C2_1 * yz * sh5;
                 val += C2_2 * (2.0 * zz - xx - yy) * sh6;
@@ -178,13 +203,13 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>, @builtin(num_workgr
 
                 if (uniforms.shDegree >= 3u) {
                      // Degree 3
-                    let sh9  = getSHHalf(c, 9u, tetId);
-                    let sh10 = getSHHalf(c, 10u, tetId);
-                    let sh11 = getSHHalf(c, 11u, tetId);
-                    let sh12 = getSHHalf(c, 12u, tetId);
-                    let sh13 = getSHHalf(c, 13u, tetId);
-                    let sh14 = getSHHalf(c, 14u, tetId);
-                    let sh15 = getSHHalf(c, 15u, tetId);
+                    let sh9  = getSH(c, 9u, tetId);
+                    let sh10 = getSH(c, 10u, tetId);
+                    let sh11 = getSH(c, 11u, tetId);
+                    let sh12 = getSH(c, 12u, tetId);
+                    let sh13 = getSH(c, 13u, tetId);
+                    let sh14 = getSH(c, 14u, tetId);
+                    let sh15 = getSH(c, 15u, tetId);
                     val += -0.5900435899266435 * y * (3 * xx - yy) * sh9;
                     val += 2.890611442640554 * xy * z * sh10;
                     val += -0.4570457994644658 * y * (4 * zz - xx - yy)* sh11;
@@ -829,11 +854,27 @@ function createWorker(self) {
     // Statically allocated buffers for sorting (unchanged)
     let keys, payload, tempKeys, tempPayload, intKeys;
 
+    function decodeHalf(float16bits) {
+        const exponent = (float16bits & 0x7C00) >> 10;
+        const fraction = float16bits & 0x03FF;
+        const sign = (float16bits & 0x8000) ? -1 : 1;
+
+        if (exponent === 0) {
+            return sign * Math.pow(2, -14) * (fraction / 1024);
+        } else if (exponent === 0x1F) {
+            return fraction ? NaN : sign * Infinity;
+        }
+
+        return sign * Math.pow(2, exponent - 15) * (1 + (fraction / 1024));
+    }
+
     function processTetrahedralData(arrayBuffer) {
         const header = new Uint32Array(arrayBuffer, 0, 4);
         data.vertexCount = header[0];
         data.tetCount = header[1];
         data.shDegree = header[2];
+        data.kComponents = header[3];
+        console.log("Sh degree: " + data.shDegree + ", kComponents: " + data.kComponents);
         let offset = 4 * 4;
 
         let start_pos_byte_len = 4 * 8;
@@ -849,16 +890,36 @@ function createWorker(self) {
         data.indices = new Uint32Array(arrayBuffer.slice(offset, offset + indexByteLength));
         offset += indexByteLength;
 
-        const densityByteLength = data.tetCount * 2;
-        data.densities = new Uint16Array(arrayBuffer.slice(offset, offset + densityByteLength));
+        const densityByteLength = data.tetCount * 1;
+        data.densities = new Uint8Array(arrayBuffer.slice(offset, offset + densityByteLength));
         offset += densityByteLength;
         offset += (4 - (offset % 4)) % 4;
 
-        const coeffsPerChannel = (data.shDegree + 1) * (data.shDegree + 1);
-        const shByteLength = data.tetCount * coeffsPerChannel * 3 * 2; 
+        const total_dims = (data.shDegree + 1) * (data.shDegree + 1) * 3;
         
-        data.shCoeffs = new Uint16Array(arrayBuffer.slice(offset, offset + shByteLength));
-        offset += shByteLength;
+        // 1. Read Mean (float16 -> float32)
+        const meanBytes = total_dims * 2;
+        const meanRaw = new Uint16Array(arrayBuffer.slice(offset, offset + meanBytes));
+        data.shMean = new Float32Array(total_dims);
+        for(let i=0; i<total_dims; i++) data.shMean[i] = decodeHalf(meanRaw[i]);
+        offset += meanBytes;
+
+        // 2. Read Basis (float16 -> float32)
+        // Size: k * total_dims
+        const basisCount = data.kComponents * total_dims;
+        const basisBytes = basisCount * 2;
+        const basisRaw = new Uint16Array(arrayBuffer.slice(offset, offset + basisBytes));
+        data.shBasis = new Float32Array(basisCount);
+        for(let i=0; i<basisCount; i++) data.shBasis[i] = decodeHalf(basisRaw[i]);
+        offset += basisBytes;
+
+        // 3. Read Weights (Keep as Uint16/Half for GPU)
+        const weightCount = data.tetCount * data.kComponents;
+        const weightBytes = weightCount * 2;
+        // We send this to GPU as uint16 array (storage buffer u32)
+        data.shWeights = new Uint16Array(arrayBuffer.slice(offset, offset + weightBytes));
+        offset += weightBytes;
+        
         offset += (4 - (offset % 4)) % 4;
 
         const gradientByteLength = data.tetCount * 3 * 2;
@@ -952,17 +1013,23 @@ function createWorker(self) {
                 densities: data.densities,
                 gradients: data.gradients,
                 tetCount: data.tetCount,
-                shCoeffs: data.shCoeffs,
                 circumcenters: data.circumcenters,
                 circumradiiSq: data.circumradiiSq,
                 shDegree: data.shDegree,
                 start_pos: data.start_pos,
+                shWeights: data.shWeights,
+                shMean: data.shMean,
+                shBasis: data.shBasis,
+                kComponents: data.kComponents,
             }, [
                 data.densities.buffer, 
                 data.gradients.buffer, 
-                data.shCoeffs.buffer,
+                // data.shCoeffs.buffer,
+                data.shWeights.buffer,
                 data.circumcenters.buffer,
-                data.circumradiiSq.buffer
+                data.circumradiiSq.buffer,
+                data.shMean.buffer,
+                data.shBasis.buffer,
             ]);
         }
     };
@@ -1128,6 +1195,8 @@ async function main() {
             { binding: 8, visibility: GPUShaderStage.COMPUTE, buffer: { type: "storage" } },
             { binding: 9, visibility: GPUShaderStage.COMPUTE, buffer: { type: "storage" } },
             { binding: 10, visibility: GPUShaderStage.COMPUTE, buffer: { type: "storage" } },
+            { binding: 11, visibility: GPUShaderStage.COMPUTE, buffer: { type: "read-only-storage" } },
+            { binding: 12, visibility: GPUShaderStage.COMPUTE, buffer: { type: "read-only-storage" } },
         ]
     });
 
@@ -1160,6 +1229,7 @@ async function main() {
     let radixSorter;
     let tetCount = 0;
     let shDegree = 0;
+    let kComponents = 0;
     let visibleCount = 0;
 
     const uniformBufferSize = 112; 
@@ -1180,6 +1250,7 @@ async function main() {
             messageEl.innerText = 'Left-drag to look. Press M to enable WASDQE.';
             tetCount = e.data.tetCount;
             shDegree = e.data.shDegree;
+            kComponents = e.data.kComponents;
 
             console.log(e.data.start_pos);
             camera.setPose(e.data.start_pos.slice(0, 3), e.data.start_pos.slice(3, 7));
@@ -1191,9 +1262,10 @@ async function main() {
             const denRaw = e.data.densities;
             const denF32 = new Float32Array(denRaw.length);
             for (let i = 0; i < denRaw.length; i++) {
-                denF32[i] = decodeHalf(denRaw[i]);
+                denF32[i] = Math.exp((denRaw[i]-100)/20);
             }
             densityBuffer = createStorageBuffer(denF32);
+
 
             // Colors setup
             const colorData = new Float32Array(e.data.tetCount * 3);
@@ -1210,7 +1282,12 @@ async function main() {
             }
             gradientBuffer = createStorageBuffer(gradF32);
 
-            const shBuffer = createStorageBuffer(e.data.shCoeffs);
+            // const shBuffer = createStorageBuffer(e.data.shCoeffs);
+
+            // Create buffers
+            const shWeightsBuffer = createStorageBuffer(e.data.shWeights); // Binding 5
+            const shMeanBuffer = createStorageBuffer(e.data.shMean);       // Binding 11
+            const shBasisBuffer = createStorageBuffer(e.data.shBasis);     // Binding 12
             circumCenterBuffer = createStorageBuffer(e.data.circumcenters);
             circumRadiiBuffer = createStorageBuffer(e.data.circumradiiSq);
 
@@ -1228,12 +1305,15 @@ async function main() {
                     { binding: 2, resource: { buffer: indexBuffer } },
                     { binding: 3, resource: { buffer: colorBuffer } }, 
                     { binding: 4, resource: { buffer: gradientBuffer } },
-                    { binding: 5, resource: { buffer: shBuffer } },
+                    // { binding: 5, resource: { buffer: shBuffer } },
+                    { binding: 5, resource: { buffer: shWeightsBuffer } },
                     { binding: 6, resource: { buffer: circumCenterBuffer } },
                     { binding: 7, resource: { buffer: circumRadiiBuffer } },
                     { binding: 8, resource: { buffer: keysBuffer } },
                     { binding: 9, resource: { buffer: valuesBuffer } },
                     { binding: 10, resource: { buffer: indirectBuffer } },
+                    { binding: 11, resource: { buffer: shMeanBuffer } },   // NEW
+                    { binding: 12, resource: { buffer: shBasisBuffer } },  // NEW
                 ]
             });
 
@@ -1330,6 +1410,7 @@ async function main() {
         uniformFloats[24] = canvas.height;
         uniformUints[25] = tetCount;
         uniformUints[26] = shDegree;
+        uniformUints[27] = kComponents;
         
         device.queue.writeBuffer(uniformBuffer, 0, cpuUniformBuffer);
         device.queue.writeBuffer(indirectBuffer, 0, resetIndirectCmd);

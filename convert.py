@@ -179,41 +179,35 @@ def tet_volumes(tets):
 def softplus(x, b=10):
     return 0.1*np.log(1+np.exp(10*x))
 
-def compress_matrix(data):
-    # 1. Reshape to (Samples, Features) -> (8000000, 48)
-    X = data.reshape(data.shape[0], -1)
-
-    # 2. Center the data (crucial for PCA/SVD interpretation)
+def compress_matrix(data, k=16):
+    # 1. Reshape to (Samples, Features)
+    X = data.reshape(data.shape[0], -1) 
+    
+    # 2. Center the data
     mean_vec = np.mean(X, axis=0)
     X_centered = X - mean_vec
 
-    # 3. Compute Covariance Matrix (48 x 48)
-    # We compute C = (X.T @ X) / (N-1). This is fast and low memory.
+    # 3. Compute Covariance Matrix
     cov_matrix = np.dot(X_centered.T, X_centered) / (X_centered.shape[0] - 1)
 
-    # 4. Eigen Decomposition on the small (48x48) matrix
+    # 4. Eigen Decomposition
     eigenvalues, eigenvectors = np.linalg.eigh(cov_matrix)
 
-    # 5. Sort eigenvectors by eigenvalues (descending)
+    # 5. Sort eigenvectors (descending)
     sorted_indices = np.argsort(eigenvalues)[::-1]
     eigenvectors = eigenvectors[:, sorted_indices]
-    eigenvalues = eigenvalues[sorted_indices]
-    print(eigenvalues)
-
-    # 6. Compress: Keep top 'k' components (e.g., k=12 for 4x compression)
-    k = 12
+    
+    # 6. Compress: Keep top 'k' components
+    # We force k=16 for GPU alignment (vec4 friendly)
     top_vectors = eigenvectors[:, :k]
 
-    # Project data onto principal components
-    # Result shape: (8000000, 12)
-    compressed_data = np.dot(X_centered, top_vectors)
-    # To Reconstruct:
-    reconstructed = np.dot(compressed_data, top_vectors.T) + mean_vec
-    reconstructed = reconstructed.reshape(-1, 16, 3)
-    print(np.abs(reconstructed - data).sum(axis=1).sum(axis=1).mean())
-    return compressed_data, top_vectors.T, mean_vec
+    # Project data
+    compressed_weights = np.dot(X_centered, top_vectors)
+    
+    # Transpose basis for easier storage: (k, 48)
+    basis = top_vectors.T 
 
-
+    return compressed_weights.astype(np.float16), basis.astype(np.float16), mean_vec.astype(np.float16)
 
 def process_ply_to_rmesh(ply_file_path, starting_cam, out_deg):
     data = tinyplypy.read_ply(ply_file_path)
@@ -223,61 +217,64 @@ def process_ply_to_rmesh(ply_file_path, starting_cam, out_deg):
     mask = np.isnan(s) | (s < 1e-3)
 
     grd = np.stack([data['tetrahedron']['grd_x'], data['tetrahedron']['grd_y'], data['tetrahedron']['grd_z']], axis=1)
+    
+    # Load raw SH
     sh_dat = load_sh(data['tetrahedron']) # Shape: (N, 16, 3)
+    # Clip to requested degree
     sh_dat = sh_dat[:, :(out_deg+1)**2]
-    sh_comp = compress_matrix(sh_dat)
-
-    # Filter masks
+    sh_dat = np.transpose(sh_dat, (0, 2, 1))
+    
+    # Filter masks before compression to avoid compressing garbage
     s = s[~mask]
     grd = grd[~mask]
     sh_dat = sh_dat[~mask]
     indices = indices[~mask]
+    vertices = vertices # Vertices are not filtered in your original logic, keeping consistent
+
+    # Compress
+    # k=16 components
+    k_components = 8
+    sh_weights, sh_basis, sh_mean = compress_matrix(sh_dat, k=k_components)
 
     N = vertices.shape[0]
     M = indices.shape[0]
 
-    tets = vertices[indices]
-    
-    # 1. Prepare Density (Log space -> uint8)
-    # density_i = np.log(s.clip(min=1e-3))*20+100
-    # density_i[density_i<=1] = 0
-    # density_t = np.clip(density_i, 0, 255).astype(np.uint8)
-    density_t = s.astype(np.float16)
+    # density_t = s.astype(np.float16)
+    density_i = np.log(s.clip(min=1e-3))*20+100
+    density_i[density_i<=1] = 0
+    density_t = np.clip(density_i, 0, 255).astype(np.uint8)
 
-    # 2. Prepare Gradients
     grd_t = grd.astype(np.float16)
 
-    # 3. Prepare SH as Half Float (float16)
-    # Cast directly to float16, no normalization to 0-255 required
-    sh_half = sh_dat.astype(np.float16)
-    
-    # Transpose to Structure of Arrays: [Channel, Coeff, Tet]
-    sh_soa = np.transpose(sh_half, (2, 1, 0))
-
-    # Flatten: [R_C0_all... R_C15_all... G_C0_all...]
-    sh_flat = sh_soa.flatten()
+    # sh_weights is already float16 from compress_matrix
+    # flatten weights: [w0_tet0, w1_tet0 ... w0_tet1 ...]
+    weights_flat = sh_weights.flatten()
 
     buffer = BytesIO()
-    buffer.write(np.array([N, M, out_deg, 0]).astype(np.uint32).tobytes())
+    # Header: N, M, Degree, K_Components
+    buffer.write(np.array([N, M, out_deg, k_components]).astype(np.uint32).tobytes())
     buffer.write(starting_cam.astype(np.float32).reshape(8).tobytes())
     buffer.write(vertices.tobytes())
     buffer.write(indices.tobytes())
     buffer.write(density_t.tobytes())
-    current_pos = buffer.tell()
-    pad_len = (4 - (current_pos % 4)) % 4
-    buffer.write(b'\x00' * pad_len)
+    
+    # Align to 4 bytes
+    while buffer.tell() % 4 != 0: buffer.write(b'\x00')
 
-    # Write the float16 buffer
-    buffer.write(sh_flat.tobytes())
-    current_pos = buffer.tell()
-    pad_len = (4 - (current_pos % 4)) % 4
-    buffer.write(b'\x00' * pad_len)
+    # Write Compression Globals
+    buffer.write(sh_mean.tobytes())  # (48,)
+    buffer.write(sh_basis.tobytes()) # (16, 48)
+    
+    # Write Per-Tet Weights
+    buffer.write(weights_flat.tobytes())
+
+    # Align
+    while buffer.tell() % 4 != 0: buffer.write(b'\x00')
 
     buffer.write(grd_t.tobytes())
 
     compressed_bytes = gzip.compress(buffer.getvalue(), compresslevel=9)
     return compressed_bytes
-
 
 def read_next_bytes(fid, num_bytes, format_char_sequence, endian_character="<"):
     """Read and unpack the next bytes from a binary file.
@@ -365,7 +362,7 @@ def main():
         "--output", "-o", default="output.rmesh", help="The output RMESH file."
     )
     parser.add_argument(
-        "--degree", "-d", type=int, default=2, help="The degree of the final mesh"
+        "--degree", "-d", type=int, default=3, help="The degree of the final mesh"
     )
     args = parser.parse_args()
     for input_file in args.input_files:

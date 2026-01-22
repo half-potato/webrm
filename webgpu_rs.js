@@ -1,13 +1,14 @@
 const computeSource = `
 struct Uniforms {
     viewProjection: mat4x4<f32>,
-    rayOrigin: vec3<f32>,      // align 16
-    camPos: vec3<f32>,         // align 16
+    rayOrigin: vec3<f32>,       // align 16
+    camPos: vec3<f32>,          // align 16
     screenWidth: f32,
     screenHeight: f32,
-    tetCount: u32,             // align 16
+    tetCount: u32,              // align 16
+    indexOffset: u32,           // CHANGED: Pre-calculated aligned offset
     shDegree: u32,
-    kComponents: u32,           // Added K
+    kComponents: u32,
 };
 
 struct DrawIndirectArgs {
@@ -18,36 +19,35 @@ struct DrawIndirectArgs {
 };
 
 @group(0) @binding(0) var<uniform> uniforms: Uniforms;
-@group(0) @binding(1) var<storage, read> vertices: array<f32>;
-@group(0) @binding(2) var<storage, read> indices: array<u32>;
-@group(0) @binding(3) var<storage, read_write> colors_compute: array<f32>;
-@group(0) @binding(4) var<storage, read> gradients: array<f32>;
-// --- COMPRESSION BUFFERS ---
+
+// Merged Vertices (0..N) and Indices (N..M)
+// Accessed as u32, bitcast to f32 for vertices
+@group(0) @binding(1) var<storage, read> geometry: array<u32>;
+
+@group(0) @binding(2) var<storage, read_write> colors_compute: array<f32>;
+@group(0) @binding(3) var<storage, read> gradients: array<f32>;
+
 // Weights: N tets * k components. Packed as f16 (u32 = 2xf16)
-@group(0) @binding(5) var<storage, read> shWeights: array<u32>; 
+@group(0) @binding(4) var<storage, read> shWeights: array<u32>; 
 
-// Mean: (Deg+1)^2 * 3 floats.
-@group(0) @binding(11) var<storage, read> shMean: array<f32>; 
+// Merged Circumcenters (xyz) and RadiiSq (w)
+@group(0) @binding(5) var<storage, read> circumData: array<vec4<f32>>;
 
-// Basis: k * (Deg+1)^2 * 3 floats.
-@group(0) @binding(12) var<storage, read> shBasis: array<f32>;
+// Merged SH Mean (start) and SH Basis (after mean)
+@group(0) @binding(6) var<storage, read> shData: array<f32>;
 
-@group(0) @binding(6) var<storage, read> circumcenters: array<f32>;
-@group(0) @binding(7) var<storage, read> circumradii: array<f32>;
-@group(0) @binding(8) var<storage, read_write> sortKeys: array<u32>;
-@group(0) @binding(9) var<storage, read_write> sortValues: array<u32>;
-@group(0) @binding(10) var<storage, read_write> indirectArgs: DrawIndirectArgs;
+@group(0) @binding(7) var<storage, read_write> sortKeys: array<u32>;
+@group(0) @binding(8) var<storage, read_write> sortValues: array<u32>;
+@group(0) @binding(9) var<storage, read_write> indirectArgs: DrawIndirectArgs;
 
 // --- SH Constants ---
 const C0 = 0.28209479177387814;
 const C1 = 0.4886025119029199;
-
 const C2_0 = 1.0925484305920792;
 const C2_1 = -1.0925484305920792;
 const C2_2 = 0.31539156525252005;
 const C2_3 = -1.0925484305920792;
 const C2_4 = 0.5462742152960396;
-
 const C3_0 = -0.5900435899266435;
 const C3_1 = 2.890611442640554;
 const C3_2 = -0.4570457994644658;
@@ -70,17 +70,18 @@ fn reconstructSH(channel: u32, coeff: u32, tetId: u32) -> f32 {
     let numCoeffs = (uniforms.shDegree + 1u) * (uniforms.shDegree + 1u);
     let featIndex = channel * numCoeffs + coeff;
     
-    var val = shMean[featIndex];
+    // Mean is at start of shData
+    var val = shData[featIndex];
+    
+    // Basis starts after Mean (Total Mean Size = numCoeffs * 3)
+    let basisOffset = numCoeffs * 3u;
     
     // Dot product: Weights(tet) . Basis(:, featIndex)
-    // Unrolled slightly for vec4 performance if possible, but loop is fine
     for (var k = 0u; k < uniforms.kComponents; k++) {
         let w = getWeight(tetId, k);
-        // Basis is flattened: [k0_all_feats, k1_all_feats...]
-        // Actually python saved as (k, 48). 
         // Index = k * total_features + featIndex
         let total_features = numCoeffs * 3u;
-        let b = shBasis[k * total_features + featIndex];
+        let b = shData[basisOffset + k * total_features + featIndex];
         val += w * b;
     }
     return val;
@@ -103,15 +104,16 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>, @builtin(num_workgr
     if (tetId >= uniforms.tetCount) { return; }
 
     // --- 1. GEOMETRY PREP ---
-    let i0 = indices[tetId * 4u + 0u] * 3u;
-    let i1 = indices[tetId * 4u + 1u] * 3u;
-    let i2 = indices[tetId * 4u + 2u] * 3u;
-    let i3 = indices[tetId * 4u + 3u] * 3u;
+    // Use the aligned offset passed from CPU
+    let i0 = geometry[uniforms.indexOffset + tetId * 4u + 0u] * 3u;
+    let i1 = geometry[uniforms.indexOffset + tetId * 4u + 1u] * 3u;
+    let i2 = geometry[uniforms.indexOffset + tetId * 4u + 2u] * 3u;
+    let i3 = geometry[uniforms.indexOffset + tetId * 4u + 3u] * 3u;
 
-    let v0 = vec3<f32>(vertices[i0], vertices[i0+1u], vertices[i0+2u]);
-    let v1 = vec3<f32>(vertices[i1], vertices[i1+1u], vertices[i1+2u]);
-    let v2 = vec3<f32>(vertices[i2], vertices[i2+1u], vertices[i2+2u]);
-    let v3 = vec3<f32>(vertices[i3], vertices[i3+1u], vertices[i3+2u]);
+    let v0 = vec3<f32>(bitcast<f32>(geometry[i0]), bitcast<f32>(geometry[i0+1u]), bitcast<f32>(geometry[i0+2u]));
+    let v1 = vec3<f32>(bitcast<f32>(geometry[i1]), bitcast<f32>(geometry[i1+1u]), bitcast<f32>(geometry[i1+2u]));
+    let v2 = vec3<f32>(bitcast<f32>(geometry[i2]), bitcast<f32>(geometry[i2+1u]), bitcast<f32>(geometry[i2+2u]));
+    let v3 = vec3<f32>(bitcast<f32>(geometry[i3]), bitcast<f32>(geometry[i3+1u]), bitcast<f32>(geometry[i3+2u]));
 
     // --- 2. CULLING ---
     let p0 = projectToNdc(v0, uniforms.viewProjection);
@@ -143,10 +145,11 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>, @builtin(num_workgr
         sortKeys[tetId] = 0xFFFFFFFFu;
         sortValues[tetId] = tetId; 
     } else {
-        let cx = circumcenters[tetId * 3u];
-        let cy = circumcenters[tetId * 3u + 1u];
-        let cz = circumcenters[tetId * 3u + 2u];
-        let r2 = circumradii[tetId];
+        let sphereData = circumData[tetId];
+        let cx = sphereData.x;
+        let cy = sphereData.y;
+        let cz = sphereData.z;
+        let r2 = sphereData.w;
 
         let diff = vec3<f32>(cx, cy, cz) - uniforms.camPos;
         let distSq = dot(diff, diff);
@@ -161,7 +164,6 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>, @builtin(num_workgr
         let centroid = (v0 + v1 + v2 + v3) * 0.25;
         let dir = normalize(centroid - uniforms.camPos); 
         
-        // Ray direction in OpenGL coords
         let x = dir.x; 
         let y = dir.y; 
         let z = dir.z;
@@ -169,27 +171,19 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>, @builtin(num_workgr
         var resultColor = vec3<f32>(0.0);
 
         for (var c = 0u; c < 3u; c++) {
-            // Degree 0
             let sh0 = getSH(c, 0u, tetId);
             var val = C0 * sh0;
-
             if (uniforms.shDegree >= 1u) {
-                // Degree 1
                 let sh1 = getSH(c, 1u, tetId);
                 let sh2 = getSH(c, 2u, tetId);
                 let sh3 = getSH(c, 3u, tetId);
-                
-                // Flip odd powers of y/z
                 val -= C1 * y * sh1;
                 val += C1 * z * sh2;
                 val -= C1 * x * sh3;
             }
-
             if (uniforms.shDegree >= 2u) {
-                // Degree 2
                 let xx = x*x; let yy = y*y; let zz = z*z;
                 let xy = x*y; let yz = y*z; let xz = x*z;
-                
                 let sh4 = getSH(c, 4u, tetId);
                 let sh5 = getSH(c, 5u, tetId);
                 let sh6 = getSH(c, 6u, tetId);
@@ -200,9 +194,7 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>, @builtin(num_workgr
                 val += C2_2 * (2.0 * zz - xx - yy) * sh6;
                 val += C2_3 * xz * sh7;
                 val += C2_4 * (xx - yy) * sh8;
-
                 if (uniforms.shDegree >= 3u) {
-                     // Degree 3
                     let sh9  = getSH(c, 9u, tetId);
                     let sh10 = getSH(c, 10u, tetId);
                     let sh11 = getSH(c, 11u, tetId);
@@ -219,7 +211,6 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>, @builtin(num_workgr
                     val += -0.5900435899266435 * x * (xx - 3 * yy) * sh15;
                 }
             }
-
             resultColor[c] = val + 0.5;
         }
 
@@ -240,11 +231,15 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>, @builtin(num_workgr
 
 const wgslSource = `
 struct Uniforms {
-    viewProjection: mat4x4<f32>, // offset 0
-    rayOrigin: vec3<f32>,        // offset 64 (align 16)
-    camPos: vec3<f32>,           // offset 80 (align 16)
-    tetCount: u32,               // offset 96 (align 16)
-    // Implicit padding makes this struct 112 bytes total
+    viewProjection: mat4x4<f32>,
+    rayOrigin: vec3<f32>,       // align 16
+    camPos: vec3<f32>,          // align 16
+    screenWidth: f32,
+    screenHeight: f32,
+    tetCount: u32,              // align 16
+    indexOffset: u32,           // CHANGED: Pre-calculated aligned offset
+    shDegree: u32,
+    kComponents: u32,
 };
 
 @group(0) @binding(0) var<uniform> uniforms: Uniforms;
@@ -266,7 +261,6 @@ struct VertexOutput {
 };
 
 // Hardcoded indices for the 4 faces of a tetrahedron (12 verts total)
-// Face 1: 0,2,1 | Face 2: 1,2,3 | Face 3: 0,3,2 | Face 4: 3,0,1
 const kTetFaceIndices = array<u32, 12>(
     0u, 2u, 1u,
     1u, 2u, 3u,
@@ -281,7 +275,6 @@ fn getVertex(index: u32) -> vec3<f32> {
 
 fn getColor(tetId: u32) -> vec3<f32> {
     let i = tetId * 3u;
-    // Use the READ-ONLY buffer here
     return vec3<f32>(colors_vertex[i], colors_vertex[i+1u], colors_vertex[i+2u]);
 }
 
@@ -294,11 +287,9 @@ fn getGradient(tetId: u32) -> vec3<f32> {
 fn vs_main(@builtin(instance_index) instanceIdx: u32, @builtin(vertex_index) vertIdx: u32) -> VertexOutput {
     var out: VertexOutput;
 
-    // 1. Get the actual Tet ID from the sorted list
     let tetId = sortedIndices[instanceIdx];
 
-    // 2. Fetch the 4 indices for this tetrahedron
-    // indices buffer is packed u32: [t0_v0, t0_v1, t0_v2, t0_v3, t1_v0...]
+    // Binding 2 (indices) is offset by verticesSize, so index 0 here is the start of indices
     let i0 = indices[tetId * 4u + 0u];
     let i1 = indices[tetId * 4u + 1u];
     let i2 = indices[tetId * 4u + 2u];
@@ -310,23 +301,18 @@ fn vs_main(@builtin(instance_index) instanceIdx: u32, @builtin(vertex_index) ver
     verts[2] = getVertex(i2);
     verts[3] = getVertex(i3);
 
-    // 3. Determine which vertex of the 12 we are drawing
-    // kTetFaceIndices maps 0..11 to 0..3 local index
     let localIndex = kTetFaceIndices[vertIdx];
     let worldPos = verts[localIndex];
 
     out.rayDir = normalize(worldPos - uniforms.rayOrigin);
     out.tetDensity = densities[tetId];
-    //out.grad = getGradient(tetId);
-    //out.tetAnchor = verts[0];
+    
     let grad = getGradient(tetId);
     out.dc_dt = dot(grad, out.rayDir);
     let offset2 = dot(grad, uniforms.rayOrigin - verts[0]);
     out.baseColor = getColor(tetId) + offset2;
 
-    // 4. Compute Planes (Ray-Tet Intersection Math)
-    // We recreate the geometry locally to compute normals
-    // Planes: (0,2,1), (1,2,3), (0,3,2), (3,0,1)
+    // Ray-Tet Intersection Planes
     let p0 = vec3<u32>(0u, 2u, 1u);
     let p1 = vec3<u32>(1u, 2u, 3u);
     let p2 = vec3<u32>(0u, 3u, 2u);
@@ -339,9 +325,7 @@ fn vs_main(@builtin(instance_index) instanceIdx: u32, @builtin(vertex_index) ver
         let vA = verts[idxs.x];
         let vB = verts[idxs.y];
         let vC = verts[idxs.z];
-
-        // Face normal
-        let n = cross(vC - vA, vB - vA);
+        let n = cross(vC - vA, vB - vA); // Face normal
 
         out.planeNumerators[i] = dot(n, vA - uniforms.rayOrigin);
         out.planeDenominators[i] = dot(n, out.rayDir);
@@ -351,13 +335,9 @@ fn vs_main(@builtin(instance_index) instanceIdx: u32, @builtin(vertex_index) ver
     return out;
 }
 
-
 // --- Fragment Shader Utils ---
-
 fn phi(x: f32) -> f32 {
-    if (abs(x) < 1e-6) {
-        return 1.0 - x * 0.5;
-    }
+    if (abs(x) < 1e-6) { return 1.0 - x * 0.5; }
     return (1.0 - exp(-x)) / x;
 }
 
@@ -379,18 +359,13 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     var opticalDepth = in.tetDensity;
     let all_t = in.planeNumerators / planeDenom;
 
-    // WebGPU doesn't have vector greaterThan/lessThan logic exactly like GLSL
-    // We use select for component-wise checks.
-
-    // t_enter: max of intersections where denom > 0
-    var t_enter = vec4<f32>(-3.402823e38); // -FLT_MAX
+    var t_enter = vec4<f32>(-3.402823e38);
     if (planeDenom.x > 0.0) { t_enter.x = all_t.x; }
     if (planeDenom.y > 0.0) { t_enter.y = all_t.y; }
     if (planeDenom.z > 0.0) { t_enter.z = all_t.z; }
     if (planeDenom.w > 0.0) { t_enter.w = all_t.w; }
 
-    // t_exit: min of intersections where denom < 0
-    var t_exit = vec4<f32>(3.402823e38); // FLT_MAX
+    var t_exit = vec4<f32>(3.402823e38); 
     if (planeDenom.x < 0.0) { t_exit.x = all_t.x; }
     if (planeDenom.y < 0.0) { t_exit.y = all_t.y; }
     if (planeDenom.z < 0.0) { t_exit.z = all_t.z; }
@@ -844,31 +819,25 @@ class Camera {
 
 // --- Web Worker Logic ---
 function createWorker(self) {
-    let data = { vertexCount: 0, tetCount: 0, vertices: null, indices: null, densities: null, colors: null, gradients: null, circumcenters: null, circumradiiSq: null };
+    let data = { vertexCount: 0, tetCount: 0, geometry: null, densities: null, gradients: null, circumData: null, shWeights: null, shData: null };
 
-    // NEW/CHANGED: ping-pong pool + reusable scratch
-    const outBufferPool = [];              // buffers returned from main
-    let sizeList = null;                   // Int32Array(M), reused
-    let counts0 = null, starts0 = null;    // Uint32Array(65536), reused
+    const outBufferPool = [];            
+    let sizeList = null;                   
+    let counts0 = null, starts0 = null;    
 
-    // Statically allocated buffers for sorting (unchanged)
     let keys, payload, tempKeys, tempPayload, intKeys;
 
     function decodeHalf(float16bits) {
         const exponent = (float16bits & 0x7C00) >> 10;
         const fraction = float16bits & 0x03FF;
         const sign = (float16bits & 0x8000) ? -1 : 1;
-
-        if (exponent === 0) {
-            return sign * Math.pow(2, -14) * (fraction / 1024);
-        } else if (exponent === 0x1F) {
-            return fraction ? NaN : sign * Infinity;
-        }
-
+        if (exponent === 0) return sign * Math.pow(2, -14) * (fraction / 1024);
+        else if (exponent === 0x1F) return fraction ? NaN : sign * Infinity;
         return sign * Math.pow(2, exponent - 15) * (1 + (fraction / 1024));
     }
 
     function processTetrahedralData(arrayBuffer) {
+        console.log("Start loading");
         const header = new Uint32Array(arrayBuffer, 0, 4);
         data.vertexCount = header[0];
         data.tetCount = header[1];
@@ -880,15 +849,32 @@ function createWorker(self) {
         let start_pos_byte_len = 4 * 8;
         const start_pos = new Float32Array(arrayBuffer.slice(offset, offset + start_pos_byte_len));
         data.start_pos = start_pos;
-        offset += start_pos_byte_len
+        offset += start_pos_byte_len;
 
         const vertexByteLength = data.vertexCount * 3 * 4;
-        data.vertices = new Float32Array(arrayBuffer.slice(offset, offset + vertexByteLength));
+        const vertices = new Float32Array(arrayBuffer.slice(offset, offset + vertexByteLength));
         offset += vertexByteLength;
 
         const indexByteLength = data.tetCount * 4 * 4;
-        data.indices = new Uint32Array(arrayBuffer.slice(offset, offset + indexByteLength));
+        const indices = new Uint32Array(arrayBuffer.slice(offset, offset + indexByteLength));
         offset += indexByteLength;
+
+        // MERGE: Geometry (Vertices then Indices) with 256-BYTE ALIGNMENT
+        // 1 float/uint = 4 bytes. 256 bytes = 64 elements.
+        const vertElCount = data.vertexCount * 3;
+        // Calculate padding needed to reach next multiple of 64
+        const padding = (64 - (vertElCount % 64)) % 64;
+        const indexOffset = vertElCount + padding; // This is the start index for indices
+        data.indexOffset = indexOffset; // Store for return
+
+        const geometryLength = indexOffset + (data.tetCount * 4);
+        data.geometry = new Uint32Array(geometryLength);
+        
+        // Cast geometry to float to write vertices
+        const geomF32 = new Float32Array(data.geometry.buffer);
+        geomF32.set(vertices, 0);
+        // Write indices after vertices and padding
+        data.geometry.set(indices, indexOffset);
 
         const densityByteLength = data.tetCount * 1;
         data.densities = new Uint8Array(arrayBuffer.slice(offset, offset + densityByteLength));
@@ -897,26 +883,29 @@ function createWorker(self) {
 
         const total_dims = (data.shDegree + 1) * (data.shDegree + 1) * 3;
         
-        // 1. Read Mean (float16 -> float32)
+        // 1. Read Mean
         const meanBytes = total_dims * 2;
         const meanRaw = new Uint16Array(arrayBuffer.slice(offset, offset + meanBytes));
-        data.shMean = new Float32Array(total_dims);
-        for(let i=0; i<total_dims; i++) data.shMean[i] = decodeHalf(meanRaw[i]);
+        const shMean = new Float32Array(total_dims);
+        for(let i=0; i<total_dims; i++) shMean[i] = decodeHalf(meanRaw[i]);
         offset += meanBytes;
 
-        // 2. Read Basis (float16 -> float32)
-        // Size: k * total_dims
+        // 2. Read Basis
         const basisCount = data.kComponents * total_dims;
         const basisBytes = basisCount * 2;
         const basisRaw = new Uint16Array(arrayBuffer.slice(offset, offset + basisBytes));
-        data.shBasis = new Float32Array(basisCount);
-        for(let i=0; i<basisCount; i++) data.shBasis[i] = decodeHalf(basisRaw[i]);
+        const shBasis = new Float32Array(basisCount);
+        for(let i=0; i<basisCount; i++) shBasis[i] = decodeHalf(basisRaw[i]);
         offset += basisBytes;
 
-        // 3. Read Weights (Keep as Uint16/Half for GPU)
+        // MERGE: SH Data (Mean then Basis)
+        data.shData = new Float32Array(total_dims + basisCount);
+        data.shData.set(shMean, 0);
+        data.shData.set(shBasis, total_dims);
+
+        // 3. Read Weights
         const weightCount = data.tetCount * data.kComponents;
         const weightBytes = weightCount * 2;
-        // We send this to GPU as uint16 array (storage buffer u32)
         data.shWeights = new Uint16Array(arrayBuffer.slice(offset, offset + weightBytes));
         offset += weightBytes;
         
@@ -925,81 +914,60 @@ function createWorker(self) {
         const gradientByteLength = data.tetCount * 3 * 2;
         data.gradients = new Uint16Array(arrayBuffer.slice(offset, offset + gradientByteLength));
 
-        data.circumcenters = new Float32Array(data.tetCount * 3);
-        data.circumradiiSq = new Float32Array(data.tetCount);
+        // MERGE: CircumData (x, y, z, rSq)
+        data.circumData = new Float32Array(data.tetCount * 4);
 
         keys = new Float32Array(data.tetCount);
         intKeys     = new Uint32Array(data.tetCount);
         tempKeys    = new Uint32Array(data.tetCount);
         tempPayload = new Uint32Array(data.tetCount);
 
-        // Loop over tetrahedra to calculate circumcenters and radii
         for (let i = 0; i < data.tetCount; i++) {
-            // 1. Get Indices of the 4 vertices
-            const i0 = data.indices[i * 4];
-            const i1 = data.indices[i * 4 + 1];
-            const i2 = data.indices[i * 4 + 2];
-            const i3 = data.indices[i * 4 + 3];
+            const i0 = indices[i * 4];
+            const i1 = indices[i * 4 + 1];
+            const i2 = indices[i * 4 + 2];
+            const i3 = indices[i * 4 + 3];
 
-            // 2. Get Coordinates for v0, v1, v2, v3
-            const v0x = data.vertices[i0 * 3], v0y = data.vertices[i0 * 3 + 1], v0z = data.vertices[i0 * 3 + 2];
-            const v1x = data.vertices[i1 * 3], v1y = data.vertices[i1 * 3 + 1], v1z = data.vertices[i1 * 3 + 2];
-            const v2x = data.vertices[i2 * 3], v2y = data.vertices[i2 * 3 + 1], v2z = data.vertices[i2 * 3 + 2];
-            const v3x = data.vertices[i3 * 3], v3y = data.vertices[i3 * 3 + 1], v3z = data.vertices[i3 * 3 + 2];
+            const v0x = vertices[i0 * 3], v0y = vertices[i0 * 3 + 1], v0z = vertices[i0 * 3 + 2];
+            const v1x = vertices[i1 * 3], v1y = vertices[i1 * 3 + 1], v1z = vertices[i1 * 3 + 2];
+            const v2x = vertices[i2 * 3], v2y = vertices[i2 * 3 + 1], v2z = vertices[i2 * 3 + 2];
+            const v3x = vertices[i3 * 3], v3y = vertices[i3 * 3 + 1], v3z = vertices[i3 * 3 + 2];
 
-            // 3. Compute vectors relative to v0 (Python: a, b, c)
             const ax = v1x - v0x, ay = v1y - v0y, az = v1z - v0z;
             const bx = v2x - v0x, by = v2y - v0y, bz = v2z - v0z;
             const cx = v3x - v0x, cy = v3y - v0y, cz = v3z - v0z;
 
-            // 4. Compute squares of lengths (Python: aa, bb, cc)
             const aa = ax * ax + ay * ay + az * az;
             const bb = bx * bx + by * by + bz * bz;
             const cc = cx * cx + cy * cy + cz * cz;
 
-            // 5. Compute Cross Products
-            // cross_bc = b x c
             const bcx = by * cz - bz * cy;
             const bcy = bz * cx - bx * cz;
             const bcz = bx * cy - by * cx;
-
-            // cross_ca = c x a
             const cax = cy * az - cz * ay;
             const cay = cz * ax - cx * az;
             const caz = cx * ay - cy * ax;
-
-            // cross_ab = a x b
             const abx = ay * bz - az * by;
             const aby = az * bx - ax * bz;
             const abz = ax * by - ay * bx;
 
-            // 6. Compute Denominator (2 * dot(a, cross_bc))
             let denominator = 2.0 * (ax * bcx + ay * bcy + az * bcz);
+            if (Math.abs(denominator) < 1e-12) denominator = 1.0; 
 
-            // Handle small denominator (degenerate tetrahedra)
-            if (Math.abs(denominator) < 1e-12) {
-                denominator = 1.0; 
-            }
-
-            // 7. Compute Relative Circumcenter
-            // (aa * cross_bc + bb * cross_ca + cc * cross_ab) / denominator
             const rx = (aa * bcx + bb * cax + cc * abx) / denominator;
             const ry = (aa * bcy + bb * cay + cc * aby) / denominator;
             const rz = (aa * bcz + bb * caz + cc * abz) / denominator;
 
-            // 8. Store Absolute Position (v0 + relative)
-            data.circumcenters[i * 3]     = v0x + rx;
-            data.circumcenters[i * 3 + 1] = v0y + ry;
-            data.circumcenters[i * 3 + 2] = v0z + rz;
-
-            // 9. Store Radius Squared (|relative|^2)
-            // Python used linalg.norm, here we need squared for the shader usually
-            data.circumradiiSq[i] = rx * rx + ry * ry + rz * rz;
+            data.circumData[i * 4 + 0] = v0x + rx;
+            data.circumData[i * 4 + 1] = v0y + ry;
+            data.circumData[i * 4 + 2] = v0z + rz;
+            data.circumData[i * 4 + 3] = rx * rx + ry * ry + rz * rz; // Radius Squared
         }
 
         sizeList = new Int32Array(data.tetCount);
         counts0 = new Uint32Array(256 * 256);
         starts0 = new Uint32Array(256 * 256);
+        console.log("Done loading");
     }
 
     self.onmessage = (e) => {
@@ -1008,33 +976,28 @@ function createWorker(self) {
         } else if (e.data.fileBuffer) {
             processTetrahedralData(e.data.fileBuffer);
             self.postMessage({
-                vertices: data.vertices,
-                indices: data.indices,
+                geometry: data.geometry,
                 densities: data.densities,
                 gradients: data.gradients,
                 tetCount: data.tetCount,
-                circumcenters: data.circumcenters,
-                circumradiiSq: data.circumradiiSq,
+                indexOffset: data.indexOffset, // Return the aligned offset
+                circumData: data.circumData,
                 shDegree: data.shDegree,
                 start_pos: data.start_pos,
                 shWeights: data.shWeights,
-                shMean: data.shMean,
-                shBasis: data.shBasis,
+                shData: data.shData,
                 kComponents: data.kComponents,
             }, [
                 data.densities.buffer, 
                 data.gradients.buffer, 
-                // data.shCoeffs.buffer,
                 data.shWeights.buffer,
-                data.circumcenters.buffer,
-                data.circumradiiSq.buffer,
-                data.shMean.buffer,
-                data.shBasis.buffer,
+                data.circumData.buffer,
+                data.shData.buffer,
+                data.geometry.buffer
             ]);
         }
     };
 }
-
 
 // --- WebGPU Main Application ---
 async function main() {
@@ -1150,7 +1113,14 @@ async function main() {
 
     function createStorageBuffer(typedArray) {
         // Align size to 4 bytes
-        const size = (typedArray.byteLength + 3) & ~3; 
+        let size = (typedArray.byteLength + 3) & ~3;
+        
+        // FIX: WebGPU does not allow binding a 0-byte buffer. 
+        // Enforce a minimum size of 4 bytes.
+        if (size === 0) {
+            size = 4;
+        }
+
         const buffer = device.createBuffer({
             size: size,
             usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
@@ -1158,17 +1128,21 @@ async function main() {
         });
         const mappedRange = buffer.getMappedRange();
         
-        // Copy data
-        if (typedArray instanceof Uint32Array) new Uint32Array(mappedRange).set(typedArray);
-        else if (typedArray instanceof Uint16Array) new Uint16Array(mappedRange).set(typedArray);
-        else if (typedArray instanceof Uint8Array) new Uint8Array(mappedRange).set(typedArray);
-        else if (typedArray instanceof Float32Array) new Float32Array(mappedRange).set(typedArray);
+        // Only copy if we actually have data
+        if (typedArray.byteLength > 0) {
+            if (typedArray instanceof Uint32Array) new Uint32Array(mappedRange).set(typedArray);
+            else if (typedArray instanceof Uint16Array) new Uint16Array(mappedRange).set(typedArray);
+            else if (typedArray instanceof Uint8Array) new Uint8Array(mappedRange).set(typedArray);
+            else if (typedArray instanceof Float32Array) new Float32Array(mappedRange).set(typedArray);
+        } else {
+            // Optional: Zero out the dummy 4 bytes to be safe
+            new Uint32Array(mappedRange)[0] = 0;
+        }
         
         buffer.unmap();
         return buffer;
     }
 
-    // --- Layouts ---
     const renderBindGroupLayout = device.createBindGroupLayout({
         label: "Render Layout",
         entries: [
@@ -1185,18 +1159,15 @@ async function main() {
     const computeBindGroupLayout = device.createBindGroupLayout({
         entries: [
             { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: "uniform" } },
-            { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: "read-only-storage" } },
-            { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: "read-only-storage" } },
-            { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: "storage" } },
-            { binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: { type: "read-only-storage" } },
-            { binding: 5, visibility: GPUShaderStage.COMPUTE, buffer: { type: "read-only-storage" } },
-            { binding: 6, visibility: GPUShaderStage.COMPUTE, buffer: { type: "read-only-storage" } },
-            { binding: 7, visibility: GPUShaderStage.COMPUTE, buffer: { type: "read-only-storage" } },
-            { binding: 8, visibility: GPUShaderStage.COMPUTE, buffer: { type: "storage" } },
-            { binding: 9, visibility: GPUShaderStage.COMPUTE, buffer: { type: "storage" } },
-            { binding: 10, visibility: GPUShaderStage.COMPUTE, buffer: { type: "storage" } },
-            { binding: 11, visibility: GPUShaderStage.COMPUTE, buffer: { type: "read-only-storage" } },
-            { binding: 12, visibility: GPUShaderStage.COMPUTE, buffer: { type: "read-only-storage" } },
+            { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: "read-only-storage" } }, // Geometry
+            { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: "storage" } },           // Colors
+            { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: "read-only-storage" } }, // Gradients
+            { binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: { type: "read-only-storage" } }, // SH Weights
+            { binding: 5, visibility: GPUShaderStage.COMPUTE, buffer: { type: "read-only-storage" } }, // CircumData
+            { binding: 6, visibility: GPUShaderStage.COMPUTE, buffer: { type: "read-only-storage" } }, // SH Data
+            { binding: 7, visibility: GPUShaderStage.COMPUTE, buffer: { type: "storage" } },           // Keys
+            { binding: 8, visibility: GPUShaderStage.COMPUTE, buffer: { type: "storage" } },           // Values
+            { binding: 9, visibility: GPUShaderStage.COMPUTE, buffer: { type: "storage" } },           // Indirect
         ]
     });
 
@@ -1224,15 +1195,16 @@ async function main() {
 
     // --- Variables ---
     let vertexBuffer, indexBuffer, densityBuffer, colorBuffer, gradientBuffer, sortedIndexBuffer;
-    let circumCenterBuffer, circumRadiiBuffer, keysBuffer, valuesBuffer, indirectBuffer;
+    let geometryBuffer, shDataBuffer, circumDataBuffer, keysBuffer, valuesBuffer, indirectBuffer;
     let bindGroup, computeBindGroup;
     let radixSorter;
     let tetCount = 0;
     let shDegree = 0;
+    let indexOffset = 0;
     let kComponents = 0;
     let visibleCount = 0;
 
-    const uniformBufferSize = 112; 
+    const uniformBufferSize = 128; 
     const uniformBuffer = device.createBuffer({
         size: uniformBufferSize,
         usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST
@@ -1245,18 +1217,18 @@ async function main() {
     const worker = new Worker(URL.createObjectURL(new Blob([`(${createWorker.toString()})(self)`], { type: "application/javascript" })));
 
     worker.onmessage = (e) => {
-        if (e.data.vertices) {
+        if (e.data.geometry) {
             spinnerEl.style.display = 'none';
             messageEl.innerText = 'Left-drag to look. Press M to enable WASDQE.';
             tetCount = e.data.tetCount;
             shDegree = e.data.shDegree;
+            indexOffset = e.data.indexOffset;
             kComponents = e.data.kComponents;
 
             console.log(e.data.start_pos);
             camera.setPose(e.data.start_pos.slice(0, 3), e.data.start_pos.slice(3, 7));
-            // <--- FIX: Using the scoped helper function without passing device
-            vertexBuffer = createStorageBuffer(e.data.vertices);
-            indexBuffer = createStorageBuffer(e.data.indices);
+            // vertexBuffer = createStorageBuffer(e.data.vertices);
+            // indexBuffer = createStorageBuffer(e.data.indices);
 
             // Densities processing
             const denRaw = e.data.densities;
@@ -1285,11 +1257,10 @@ async function main() {
             // const shBuffer = createStorageBuffer(e.data.shCoeffs);
 
             // Create buffers
-            const shWeightsBuffer = createStorageBuffer(e.data.shWeights); // Binding 5
-            const shMeanBuffer = createStorageBuffer(e.data.shMean);       // Binding 11
-            const shBasisBuffer = createStorageBuffer(e.data.shBasis);     // Binding 12
-            circumCenterBuffer = createStorageBuffer(e.data.circumcenters);
-            circumRadiiBuffer = createStorageBuffer(e.data.circumradiiSq);
+            geometryBuffer = createStorageBuffer(e.data.geometry);
+            circumDataBuffer = createStorageBuffer(e.data.circumData);
+            shDataBuffer = createStorageBuffer(e.data.shData);
+            shWeightsBuffer = createStorageBuffer(e.data.shWeights);
 
             // buffers for sort/indirect
             sortedIndexBuffer = device.createBuffer({ size: tetCount * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
@@ -1301,19 +1272,15 @@ async function main() {
                 layout: computeBindGroupLayout,
                 entries: [
                     { binding: 0, resource: { buffer: uniformBuffer } },
-                    { binding: 1, resource: { buffer: vertexBuffer } },
-                    { binding: 2, resource: { buffer: indexBuffer } },
-                    { binding: 3, resource: { buffer: colorBuffer } }, 
-                    { binding: 4, resource: { buffer: gradientBuffer } },
-                    // { binding: 5, resource: { buffer: shBuffer } },
-                    { binding: 5, resource: { buffer: shWeightsBuffer } },
-                    { binding: 6, resource: { buffer: circumCenterBuffer } },
-                    { binding: 7, resource: { buffer: circumRadiiBuffer } },
-                    { binding: 8, resource: { buffer: keysBuffer } },
-                    { binding: 9, resource: { buffer: valuesBuffer } },
-                    { binding: 10, resource: { buffer: indirectBuffer } },
-                    { binding: 11, resource: { buffer: shMeanBuffer } },   // NEW
-                    { binding: 12, resource: { buffer: shBasisBuffer } },  // NEW
+                    { binding: 1, resource: { buffer: geometryBuffer } },
+                    { binding: 2, resource: { buffer: colorBuffer } }, 
+                    { binding: 3, resource: { buffer: gradientBuffer } },
+                    { binding: 4, resource: { buffer: shWeightsBuffer } },
+                    { binding: 5, resource: { buffer: circumDataBuffer } },
+                    { binding: 6, resource: { buffer: shDataBuffer } },
+                    { binding: 7, resource: { buffer: keysBuffer } },
+                    { binding: 8, resource: { buffer: valuesBuffer } },
+                    { binding: 9, resource: { buffer: indirectBuffer } },
                 ]
             });
 
@@ -1337,13 +1304,19 @@ async function main() {
     };
 
     function createBindGroup() {
-        if (!vertexBuffer) return;
+        if (!geometryBuffer) return;
+        
+        // Calculate offsets for render binding (reading from one merged buffer)
+        const verticesSize = indexOffset * 4;
+        
         bindGroup = device.createBindGroup({
             layout: renderBindGroupLayout,
             entries: [
                 { binding: 0, resource: { buffer: uniformBuffer } },
-                { binding: 1, resource: { buffer: vertexBuffer } },
-                { binding: 2, resource: { buffer: indexBuffer } },
+                // Range 1: Vertices
+                { binding: 1, resource: { buffer: geometryBuffer, offset: 0, size: verticesSize } },
+                // Range 2: Indices (Starts after vertices)
+                { binding: 2, resource: { buffer: geometryBuffer, offset: verticesSize } },
                 { binding: 3, resource: { buffer: densityBuffer } },
                 { binding: 4, resource: { buffer: colorBuffer } },
                 { binding: 5, resource: { buffer: gradientBuffer } },
@@ -1351,8 +1324,6 @@ async function main() {
             ]
         });
     }
-
-    // --- Rendering ---
     const camera = new Camera([0, 3, -3], canvas);
     
     const resize = () => {
@@ -1408,9 +1379,11 @@ async function main() {
         uniformFloats[22] = camera.position[2];
         uniformFloats[23] = canvas.width;
         uniformFloats[24] = canvas.height;
+
         uniformUints[25] = tetCount;
-        uniformUints[26] = shDegree;
-        uniformUints[27] = kComponents;
+        uniformUints[26] = indexOffset;
+        uniformUints[27] = shDegree;
+        uniformUints[28] = kComponents;
         
         device.queue.writeBuffer(uniformBuffer, 0, cpuUniformBuffer);
         device.queue.writeBuffer(indirectBuffer, 0, resetIndirectCmd);
@@ -1452,7 +1425,6 @@ async function main() {
         if (bindGroup) {
             passEncoder.setPipeline(pipeline);
             passEncoder.setBindGroup(0, bindGroup);
-            // <--- FIX: Variable name mismatch. Was 'renderPass', changed to 'passEncoder'
             passEncoder.drawIndirect(indirectBuffer, 0); 
         }
 
